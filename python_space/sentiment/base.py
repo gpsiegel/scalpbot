@@ -54,6 +54,11 @@ COIN_METADATA: Dict[str, Dict[str, Any]] = {
         "cryptocv_ticker": "AVAX", "lunarcrush_symbol": "AVAX",
         "subreddits": ["Avax"], "trends_keywords": ["Avalanche", "AVAX crypto"],
     },
+    "ADA": {
+        "name": "Cardano", "symbol": "ADA", "coingecko_id": "cardano",
+        "cryptocv_ticker": "ADA", "lunarcrush_symbol": "ADA",
+        "subreddits": ["cardano"], "trends_keywords": ["Cardano", "ADA crypto"],
+    },
     "LINK": {
         "name": "Chainlink", "symbol": "LINK", "coingecko_id": "chainlink",
         "cryptocv_ticker": "LINK", "lunarcrush_symbol": "LINK",
