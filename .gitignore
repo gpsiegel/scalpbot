@@ -27,12 +27,20 @@ env/
 
 # OpenTofu / Terraform (IaC)
 .terraform/
+.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 crash.log
 crash.*.log
 tfplan
 *.tfplan
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
 # Real backend/tfvars configs (keep the *.example templates)
 opentofu/backend-*.hcl
 !opentofu/backend-*.hcl.example
