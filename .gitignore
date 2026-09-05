@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Secrets / local env -- NEVER commit real values
+.env
+*.env.local
+!.env.example
+!doppler.env.example
+
+# trendspyg local caches / archives
+*.sqlite
+.trendspyg_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
