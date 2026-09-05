@@ -1,0 +1,69 @@
+# =============================================================================
+# deploy.yml -- deploy the scalpbot application to the DigitalOcean droplet
+# =============================================================================
+# Migrated from Linode (us-ord) to DigitalOcean (nyc3). Secrets managed by
+# Doppler; app pulls its config/secrets at runtime via DOPPLER_TOKEN.
+# =============================================================================
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python_space/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy"
+        required: true
+        default: nonprod
+        type: choice
+        options: [nonprod, staging, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy (${{ github.event.inputs.environment || 'nonprod' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'nonprod' }}
+    env:
+      # Deploy target is the reserved IP / host of the droplet.
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      RESERVED_IPV4: ${{ secrets.RESERVED_IPV4 }}
+      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install doctl (DigitalOcean CLI)
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+
+      - name: Resolve deploy host
+        run: |
+          # Prefer the explicit reserved IP; fall back to DEPLOY_HOST.
+          HOST="${RESERVED_IPV4:-$DEPLOY_HOST}"
+          echo "DEPLOY_TARGET=${HOST}" >> "$GITHUB_ENV"
+          echo "Deploying to ${HOST} (nyc3)"
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${DEPLOY_TARGET}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy over SSH
+        run: |
+          ssh -n -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new \
+            root@"${DEPLOY_TARGET}" \
+            "cd /opt/scalpbot && git pull --ff-only && \
+             pip install -r python_space/requirements.txt && \
+             DOPPLER_TOKEN='${DOPPLER_TOKEN}' doppler run -- \
+               systemctl restart scalpbot"

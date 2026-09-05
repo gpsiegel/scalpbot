@@ -23,3 +23,18 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+
+# OpenTofu / Terraform (IaC)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+tfplan
+*.tfplan
+# Real backend/tfvars configs (keep the *.example templates)
+opentofu/backend-*.hcl
+!opentofu/backend-*.hcl.example
+opentofu/*.tfvars
+!opentofu/*.tfvars.example
