@@ -1,7 +1,7 @@
 # =============================================================================
 # infra.yml -- provision/update scalpbot infrastructure with OpenTofu
 # =============================================================================
-# Target cloud: DigitalOcean (nyc3). Migrated from Linode (us-ord).
+# Target cloud: DigitalOcean (nyc3).
 # Uses the `tofu` CLI (OpenTofu 1.10), NOT terraform. State lives in an
 # S3-compatible bucket; state encryption is configured via TF_ENCRYPTION.
 # =============================================================================
@@ -40,7 +40,7 @@ jobs:
         working-directory: opentofu
     env:
       TF_IN_AUTOMATION: "true"
-      # DigitalOcean API token (replaces LINODE_TOKEN).
+      # DigitalOcean API token.
       DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
       TF_VAR_do_token: ${{ secrets.DIGITALOCEAN_TOKEN }}
       TF_VAR_environment: ${{ github.event.inputs.environment || 'nonprod' }}

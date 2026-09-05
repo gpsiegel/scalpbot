@@ -24,7 +24,7 @@ variable "region" {
 }
 
 variable "droplet_size" {
-  description = "DigitalOcean droplet size slug. s-1vcpu-2gb == 2 GB RAM (equivalent to the old Linode 2 GB instance)."
+  description = "DigitalOcean droplet size slug. s-1vcpu-2gb == 2 GB RAM."
   type        = string
   default     = "s-1vcpu-2gb"
 }
@@ -36,7 +36,7 @@ variable "droplet_image" {
 }
 
 variable "enable_backups" {
-  description = "Enable DigitalOcean automated droplet backups (matches the prior Linode backups setting)."
+  description = "Enable DigitalOcean automated droplet backups."
   type        = bool
   default     = true
 }
