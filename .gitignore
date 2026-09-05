@@ -38,3 +38,7 @@ opentofu/backend-*.hcl
 !opentofu/backend-*.hcl.example
 opentofu/*.tfvars
 !opentofu/*.tfvars.example
+
+# Local SQLite fallback DB (engine dev/test)
+*.db
+scalpbot_local.db

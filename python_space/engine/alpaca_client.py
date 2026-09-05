@@ -1,0 +1,278 @@
+"""Alpaca brokerage + market-data wrapper for scalpbot.
+
+Covers all three avenues through one object:
+
+* **crypto** -- 24/7 spot, symbols like ``SOL/USD``, ``time_in_force=gtc``.
+* **stocks** -- US equities, gated on market hours.
+* **options** -- US equity options (buy-to-open long calls/puts only).
+
+Design notes
+------------
+* ``alpaca-py`` is imported lazily inside :meth:`_ensure` so this module (and
+  everything that imports it) loads even when the package is absent -- unit
+  tests construct the client with ``lazy=True`` and never touch the network.
+* Paper vs. live is a single ``paper`` flag wired straight into
+  ``TradingClient(paper=...)``. The live-trading guard lives in
+  :class:`config.Config`; this wrapper just does what it is told.
+* API credentials come from the environment (Doppler secrets):
+  ``ALPACA_API_KEY`` / ``ALPACA_SECRET_KEY``. Nothing is hard-coded.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from typing import List, Optional
+
+logger = logging.getLogger("scalpbot.engine.alpaca")
+
+
+@dataclass
+class OrderResult:
+    """Normalized result of an order submission."""
+
+    ok: bool
+    order_id: Optional[str] = None
+    filled_qty: float = 0.0
+    filled_price: float = 0.0
+    status: str = ""
+    raw: Optional[object] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class OptionContract:
+    """A single option contract candidate from the chain."""
+
+    symbol: str            # OCC symbol, e.g. SOFI250117C00010000
+    underlying: str
+    option_type: str       # "call" | "put"
+    strike: float
+    expiration: str        # YYYY-MM-DD
+    bid: float = 0.0
+    ask: float = 0.0
+    last: float = 0.0
+    open_interest: int = 0
+
+    @property
+    def mid(self) -> float:
+        if self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / 2.0
+        return self.last or self.ask or self.bid
+
+    @property
+    def spread_pct(self) -> float:
+        if self.bid > 0 and self.ask > 0:
+            return (self.ask - self.bid) / ((self.ask + self.bid) / 2.0)
+        return 1.0  # unknown / illiquid -> treat as maximally wide
+
+
+class AlpacaClient:
+    """Thin, defensive wrapper over the Alpaca trading + data SDK."""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        paper: bool = True,
+        lazy: bool = False,
+    ):
+        self.api_key = api_key or os.environ.get("ALPACA_API_KEY")
+        self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY")
+        self.paper = paper
+        self._trading = None
+        self._crypto_data = None
+        self._stock_data = None
+        self._option_data = None
+        self._sdk = None
+        if not lazy:
+            self._ensure()
+
+    # -- lazy SDK bootstrap -------------------------------------------------
+    def _ensure(self):
+        """Import alpaca-py and construct the SDK clients on first use."""
+        if self._trading is not None:
+            return
+        if not self.api_key or not self.secret_key:
+            raise RuntimeError(
+                "ALPACA_API_KEY / ALPACA_SECRET_KEY not set (expected from Doppler)"
+            )
+        try:
+            from alpaca.trading.client import TradingClient
+            from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+            from alpaca.data.historical.stock import StockHistoricalDataClient
+            try:
+                from alpaca.data.historical.option import OptionHistoricalDataClient
+            except Exception:  # older alpaca-py without option data client
+                OptionHistoricalDataClient = None
+            import alpaca as _sdk
+        except ImportError as exc:  # pragma: no cover - env dependent
+            raise RuntimeError(
+                "alpaca-py is not installed; add it from requirements.txt"
+            ) from exc
+
+        self._sdk = _sdk
+        self._trading = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+        self._crypto_data = CryptoHistoricalDataClient(self.api_key, self.secret_key)
+        self._stock_data = StockHistoricalDataClient(self.api_key, self.secret_key)
+        self._option_data = (
+            OptionHistoricalDataClient(self.api_key, self.secret_key)
+            if OptionHistoricalDataClient
+            else None
+        )
+
+    # -- market clock -------------------------------------------------------
+    def is_market_open(self) -> bool:
+        """True if the US equities market is open right now (crypto is 24/7)."""
+        self._ensure()
+        try:
+            return bool(self._trading.get_clock().is_open)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("get_clock failed: %s", exc)
+            return False
+
+    # -- prices -------------------------------------------------------------
+    def get_crypto_price(self, symbol: str) -> Optional[float]:
+        """Latest trade price for a crypto pair like ``SOL/USD``."""
+        self._ensure()
+        try:
+            from alpaca.data.requests import CryptoLatestTradeRequest
+
+            req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+            resp = self._crypto_data.get_crypto_latest_trade(req)
+            return float(resp[symbol].price)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("get_crypto_price(%s) failed: %s", symbol, exc)
+            return None
+
+    def get_stock_price(self, symbol: str) -> Optional[float]:
+        """Latest trade price for a US equity."""
+        self._ensure()
+        try:
+            from alpaca.data.requests import StockLatestTradeRequest
+
+            req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+            resp = self._stock_data.get_stock_latest_trade(req)
+            return float(resp[symbol].price)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("get_stock_price(%s) failed: %s", symbol, exc)
+            return None
+
+    # -- options chain ------------------------------------------------------
+    def list_option_contracts(
+        self,
+        underlying: str,
+        option_type: str,
+        expiration_gte: Optional[str] = None,
+        expiration_lte: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[OptionContract]:
+        """Fetch tradable option contracts for an underlying, then enrich with a
+        latest quote (bid/ask) so the caller can apply spread/premium filters."""
+        self._ensure()
+        contracts: List[OptionContract] = []
+        try:
+            from alpaca.trading.requests import GetOptionContractsRequest
+            from alpaca.trading.enums import ContractType, AssetStatus
+
+            ctype = ContractType.CALL if option_type == "call" else ContractType.PUT
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                status=AssetStatus.ACTIVE,
+                type=ctype,
+                expiration_date_gte=expiration_gte,
+                expiration_date_lte=expiration_lte,
+                limit=limit,
+            )
+            resp = self._trading.get_option_contracts(req)
+            raw_list = getattr(resp, "option_contracts", resp) or []
+            for c in raw_list:
+                contracts.append(
+                    OptionContract(
+                        symbol=c.symbol,
+                        underlying=underlying,
+                        option_type=option_type,
+                        strike=float(c.strike_price),
+                        expiration=str(c.expiration_date),
+                        open_interest=int(getattr(c, "open_interest", 0) or 0),
+                    )
+                )
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("list_option_contracts(%s) failed: %s", underlying, exc)
+            return []
+
+        self._enrich_option_quotes(contracts)
+        return contracts
+
+    def _enrich_option_quotes(self, contracts: List[OptionContract]) -> None:
+        if not contracts or self._option_data is None:
+            return
+        try:
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            symbols = [c.symbol for c in contracts]
+            req = OptionLatestQuoteRequest(symbol_or_symbols=symbols)
+            quotes = self._option_data.get_option_latest_quote(req)
+            for c in contracts:
+                q = quotes.get(c.symbol)
+                if q is not None:
+                    c.bid = float(getattr(q, "bid_price", 0.0) or 0.0)
+                    c.ask = float(getattr(q, "ask_price", 0.0) or 0.0)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("option quote enrich failed: %s", exc)
+
+    # -- orders -------------------------------------------------------------
+    def submit_crypto_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        """Market order for a crypto pair. TIF=GTC (crypto requirement)."""
+        return self._submit_market(symbol, side, qty, market="crypto")
+
+    def submit_stock_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        """Market order for a US equity. TIF=DAY."""
+        return self._submit_market(symbol, side, qty, market="stock")
+
+    def submit_option_order(self, symbol: str, side: str, contracts: int) -> OrderResult:
+        """Market order for an option contract (OCC symbol). TIF=DAY."""
+        return self._submit_market(symbol, side, contracts, market="option")
+
+    def _submit_market(self, symbol: str, side: str, qty: float, market: str) -> OrderResult:
+        self._ensure()
+        try:
+            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+
+            order_side = OrderSide.BUY if side.lower() in ("buy", "long") else OrderSide.SELL
+            # Crypto must use GTC; equities/options use DAY.
+            tif = TimeInForce.GTC if market == "crypto" else TimeInForce.DAY
+            req = MarketOrderRequest(
+                symbol=symbol,
+                side=order_side,
+                time_in_force=tif,
+                **({"qty": qty}),
+            )
+            order = self._trading.submit_order(req)
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+            filled_avg = float(getattr(order, "filled_avg_price", 0) or 0)
+            return OrderResult(
+                ok=True,
+                order_id=str(order.id),
+                filled_qty=filled_qty,
+                filled_price=filled_avg,
+                status=str(getattr(order, "status", "")),
+                raw=order,
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.error("submit order %s %s %s failed: %s", market, symbol, side, exc)
+            return OrderResult(ok=False, error=str(exc))
+
+    # -- account/positions --------------------------------------------------
+    def get_account(self):  # pragma: no cover - network dependent
+        self._ensure()
+        return self._trading.get_account()
+
+    def list_positions(self):  # pragma: no cover - network dependent
+        self._ensure()
+        try:
+            return self._trading.get_all_positions()
+        except Exception as exc:
+            logger.warning("list_positions failed: %s", exc)
+            return []

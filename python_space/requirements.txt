@@ -18,3 +18,18 @@ trendspyg>=1.6.0
 #   * Fear & Greed Index -> plain HTTP via `requests` (no key)
 #
 # REMOVED sources (do not re-add): cryptopanic, tweepy/twitter, pytrends, newsapi-python
+
+# ---------------------------------------------------------------------------
+# Trading engine
+# ---------------------------------------------------------------------------
+# Alpaca brokerage + market data (crypto, stocks, options).
+alpaca-py>=0.33.0
+
+# Persistence: Trade / Position / BotConfig / SignalLog in Postgres.
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# Local control-plane API (bound to 127.0.0.1, X-API-Key on mutations).
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
