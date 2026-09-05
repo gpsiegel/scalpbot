@@ -1,12 +1,7 @@
 # =============================================================================
-# main.tf -- scalpbot core compute on DigitalOcean (migrated from Linode)
+# main.tf -- scalpbot core compute on DigitalOcean
 # =============================================================================
-# Resource mapping (Linode -> DigitalOcean):
-#   linode_instance          -> digitalocean_droplet
-#   linode reserved/extra IP -> digitalocean_reserved_ip + _assignment
-#   linode_firewall          -> digitalocean_firewall
-#   linode SSH key           -> digitalocean_ssh_key
-# Region: us-ord (Chicago) -> nyc3 (New York 3, low latency to Alpaca).
+# Region: nyc3 (New York 3, low latency to Alpaca).
 # =============================================================================
 
 locals {
@@ -15,7 +10,7 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
-# SSH key (deploy access) -- was a Linode-managed SSH key
+# SSH key (deploy access)
 # -----------------------------------------------------------------------------
 resource "digitalocean_ssh_key" "deploy" {
   name       = "${local.name}-deploy"
@@ -23,8 +18,7 @@ resource "digitalocean_ssh_key" "deploy" {
 }
 
 # -----------------------------------------------------------------------------
-# Droplet -- was linode_instance (Linode 2 GB, us-ord)
-# Postgres is co-hosted on this box initially (same approach as on Linode).
+# Droplet -- 2 GB app server; Postgres is co-hosted on this box initially.
 # -----------------------------------------------------------------------------
 resource "digitalocean_droplet" "app" {
   name     = local.name
@@ -36,14 +30,14 @@ resource "digitalocean_droplet" "app" {
   ssh_keys = [digitalocean_ssh_key.deploy.fingerprint]
   tags     = local.common_tags
 
-  # Root password is NOT set here: SSH key auth only (LINODE_ROOT_PASS removed).
+  # Root password is NOT set here: SSH key auth only.
   lifecycle {
     ignore_changes = [image] # avoid rebuilds if the base image slug moves
   }
 }
 
 # -----------------------------------------------------------------------------
-# Reserved IP -- was the Linode reserved/extra IPv4 (RESERVED_IPV4)
+# Reserved IP (RESERVED_IPV4)
 # Split into the address + an assignment so the IP survives droplet rebuilds.
 # -----------------------------------------------------------------------------
 resource "digitalocean_reserved_ip" "app" {
@@ -56,7 +50,7 @@ resource "digitalocean_reserved_ip_assignment" "app" {
 }
 
 # -----------------------------------------------------------------------------
-# Firewall -- was linode_firewall
+# Firewall
 # Inbound: SSH (restrictable), HTTP/HTTPS. The API server binds 127.0.0.1 only,
 # so its port is intentionally NOT exposed. Outbound: allow all.
 # -----------------------------------------------------------------------------

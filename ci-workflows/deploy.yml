@@ -1,8 +1,8 @@
 # =============================================================================
 # deploy.yml -- deploy the scalpbot application to the DigitalOcean droplet
 # =============================================================================
-# Migrated from Linode (us-ord) to DigitalOcean (nyc3). Secrets managed by
-# Doppler; app pulls its config/secrets at runtime via DOPPLER_TOKEN.
+# Target cloud: DigitalOcean (nyc3). Secrets managed by Doppler; app pulls its
+# config/secrets at runtime via DOPPLER_TOKEN.
 # =============================================================================
 
 name: deploy

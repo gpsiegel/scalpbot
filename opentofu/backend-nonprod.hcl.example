@@ -8,18 +8,16 @@
 #   export AWS_ACCESS_KEY_ID="$TFSTATE_S3_ACCESS_KEY"
 #   export AWS_SECRET_ACCESS_KEY="$TFSTATE_S3_SECRET_KEY"
 #
-# The existing Linode Object Storage bucket is S3-compatible and works as-is.
-# To move to DigitalOcean Spaces later, only the `endpoints`/`region` change
-# (e.g. https://nyc3.digitaloceanspaces.com). See opentofu/README.md.
+# State is stored in a DigitalOcean Spaces bucket (S3-compatible).
+# Create the Spaces bucket + access keys in the DigitalOcean console, then set
+# TFSTATE_S3_ACCESS_KEY / TFSTATE_S3_SECRET_KEY from the Spaces credentials.
 # =============================================================================
 
 bucket = "scalpbot-tfstate"
 key    = "nonprod/terraform.tfstate"
 
-# Linode Object Storage (current) example endpoint:
-endpoints = { s3 = "https://us-ord-1.linodeobjects.com" }
-# DigitalOcean Spaces (optional migration) example endpoint:
-# endpoints = { s3 = "https://nyc3.digitaloceanspaces.com" }
+# DigitalOcean Spaces (nyc3) endpoint:
+endpoints = { s3 = "https://nyc3.digitaloceanspaces.com" }
 
 region = "us-east-1" # dummy value required by the S3 backend for non-AWS stores
 

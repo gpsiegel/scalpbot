@@ -29,9 +29,7 @@ migration so it can commit them directly.)
 
 Add for each environment (`nonprod` / `staging` / `prod`):
 
-- `DIGITALOCEAN_TOKEN` (replaces `LINODE_TOKEN`)
+- `DIGITALOCEAN_TOKEN`
 - `DEPLOY_SSH_PUBKEY`, `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `RESERVED_IPV4`
 - `DOPPLER_TOKEN`
 - `TFSTATE_S3_ACCESS_KEY`, `TFSTATE_S3_SECRET_KEY`, `TF_ENCRYPTION`
-
-Remove: `LINODE_TOKEN`, `LINODE_ROOT_PASS`.

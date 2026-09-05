@@ -18,10 +18,7 @@ terraform {
   # ---------------------------------------------------------------------------
   # Remote state backend (S3-compatible object storage)
   # ---------------------------------------------------------------------------
-  # This backend was originally pointed at Linode Object Storage, which is
-  # S3-compatible and CONTINUES TO WORK unchanged. You may optionally migrate
-  # the bucket to DigitalOcean Spaces (also S3-compatible) -- see the PR
-  # description / opentofu/README.md for the exact steps.
+  # State lives in a DigitalOcean Spaces bucket (S3-compatible).
   #
   # The non-secret values below (bucket, key, endpoint, region) are supplied at
   # `tofu init` time via `-backend-config=backend-<env>.hcl`, keeping the state

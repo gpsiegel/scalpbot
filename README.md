@@ -1,8 +1,8 @@
 # scalpbot
 
 Multi-avenue trading bot (Crypto + Stocks + Options), Python, deployed on
-**DigitalOcean** (`nyc3`, migrated from Linode). Secrets via Doppler;
-non-secret operational config via plain `.env`.
+**DigitalOcean** (`nyc3`). Secrets via Doppler; non-secret operational config
+via plain `.env`.
 
 ## Infrastructure
 
@@ -16,14 +16,12 @@ non-secret operational config via plain `.env`.
   and `doctl`. These currently live in [`ci-workflows/`](ci-workflows/README.md)
   and must be moved into `.github/workflows/` (see that README — the PR
   automation lacked the GitHub `workflows` permission).
-- **State:** S3-compatible backend (existing Linode Object Storage bucket still
-  works; optional migration to DigitalOcean Spaces documented in the infra
-  README).
+- **State:** S3-compatible backend on DigitalOcean Spaces (`nyc3`), documented
+  in the infra README.
 
 Reserve a floating/reserved IP manually with:
 
 ```bash
-# Old (Linode):  linode-cli networking ip-reserve --region us-ord
 doctl compute reserved-ip create --region nyc3
 ```
 
