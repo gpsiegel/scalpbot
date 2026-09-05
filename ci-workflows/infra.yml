@@ -1,0 +1,97 @@
+# =============================================================================
+# infra.yml -- provision/update scalpbot infrastructure with OpenTofu
+# =============================================================================
+# Target cloud: DigitalOcean (nyc3). Migrated from Linode (us-ord).
+# Uses the `tofu` CLI (OpenTofu 1.10), NOT terraform. State lives in an
+# S3-compatible bucket; state encryption is configured via TF_ENCRYPTION.
+# =============================================================================
+
+name: infra
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "opentofu/**"
+      - ".github/workflows/infra.yml"
+  pull_request:
+    paths:
+      - "opentofu/**"
+      - ".github/workflows/infra.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply"
+        required: true
+        default: nonprod
+        type: choice
+        options: [nonprod, staging, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  tofu:
+    name: OpenTofu (${{ github.event.inputs.environment || 'nonprod' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'nonprod' }}
+    defaults:
+      run:
+        working-directory: opentofu
+    env:
+      TF_IN_AUTOMATION: "true"
+      # DigitalOcean API token (replaces LINODE_TOKEN).
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+      TF_VAR_do_token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+      TF_VAR_environment: ${{ github.event.inputs.environment || 'nonprod' }}
+      TF_VAR_ssh_public_key: ${{ secrets.DEPLOY_SSH_PUBKEY }}
+      # S3-compatible state backend credentials.
+      AWS_ACCESS_KEY_ID: ${{ secrets.TFSTATE_S3_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TFSTATE_S3_SECRET_KEY }}
+      # Full OpenTofu state-encryption configuration (HCL/JSON) is read directly
+      # from this env var by OpenTofu 1.7+.
+      TF_ENCRYPTION: ${{ secrets.TF_ENCRYPTION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu 1.10
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.10.0"
+
+      - name: Install doctl (DigitalOcean CLI)
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+
+      - name: Verify DigitalOcean auth
+        run: doctl account get
+
+      - name: Render backend config
+        run: |
+          ENV="${TF_VAR_environment}"
+          cp "backend-${ENV}.hcl.example" "backend-${ENV}.hcl" 2>/dev/null || true
+          echo "Using backend-${ENV}.hcl"
+
+      - name: Tofu fmt check
+        run: tofu fmt -check -recursive
+
+      - name: Tofu init
+        run: tofu init -input=false -backend-config="backend-${TF_VAR_environment}.hcl"
+
+      - name: Select/create workspace
+        run: tofu workspace select "${TF_VAR_environment}" || tofu workspace new "${TF_VAR_environment}"
+
+      - name: Tofu validate
+        run: tofu validate
+
+      - name: Tofu plan
+        run: tofu plan -input=false -var-file="${TF_VAR_environment}.tfvars" -out=tfplan
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+      # Apply only on manual dispatch or push to main (never on PRs).
+      - name: Tofu apply
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        run: tofu apply -input=false -auto-approve tfplan

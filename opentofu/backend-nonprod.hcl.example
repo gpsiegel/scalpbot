@@ -1,0 +1,30 @@
+# =============================================================================
+# backend-nonprod.hcl.example -- S3-compatible remote state backend config
+# =============================================================================
+# Copy to backend-nonprod.hcl and pass at init:
+#   tofu init -backend-config=backend-nonprod.hcl
+#
+# Credentials come from env vars (never commit them):
+#   export AWS_ACCESS_KEY_ID="$TFSTATE_S3_ACCESS_KEY"
+#   export AWS_SECRET_ACCESS_KEY="$TFSTATE_S3_SECRET_KEY"
+#
+# The existing Linode Object Storage bucket is S3-compatible and works as-is.
+# To move to DigitalOcean Spaces later, only the `endpoints`/`region` change
+# (e.g. https://nyc3.digitaloceanspaces.com). See opentofu/README.md.
+# =============================================================================
+
+bucket = "scalpbot-tfstate"
+key    = "nonprod/terraform.tfstate"
+
+# Linode Object Storage (current) example endpoint:
+endpoints = { s3 = "https://us-ord-1.linodeobjects.com" }
+# DigitalOcean Spaces (optional migration) example endpoint:
+# endpoints = { s3 = "https://nyc3.digitaloceanspaces.com" }
+
+region = "us-east-1" # dummy value required by the S3 backend for non-AWS stores
+
+skip_credentials_validation = true
+skip_metadata_api_check     = true
+skip_region_validation      = true
+skip_requesting_account_id  = true
+use_path_style              = true
