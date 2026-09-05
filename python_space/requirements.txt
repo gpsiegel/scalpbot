@@ -1,0 +1,20 @@
+# scalpbot python dependencies
+# ---------------------------------------------------------------------------
+# Sentiment stack
+# ---------------------------------------------------------------------------
+requests>=2.31.0
+
+# Reddit OAuth client (r/solana, r/dogecoin, r/CryptoCurrency, r/CryptoMarkets)
+praw>=7.7.0
+
+# Google Trends -- drop-in replacement for the archived `pytrends` library.
+# (pytrends was archived April 2025 and is intentionally NOT installed.)
+trendspyg>=1.6.0
+
+# NOTE: The following sentiment sources need NO extra dependency:
+#   * cryptocurrency.cv  -> plain HTTP via `requests` (no key)
+#   * CoinGecko          -> plain HTTP via `requests` (COINGECKO_API_KEY)
+#   * LunarCrush         -> plain HTTP via `requests` (LUNARCRUSH_API_KEY)
+#   * Fear & Greed Index -> plain HTTP via `requests` (no key)
+#
+# REMOVED sources (do not re-add): cryptopanic, tweepy/twitter, pytrends, newsapi-python
