@@ -16,11 +16,68 @@ enforces this so a typo fails fast instead of silently dropping a coin.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List
 
 from sentiment.base import COIN_METADATA
+
+logger = logging.getLogger("scalpbot.config")
+
+# Recognised environments. There is NO "staging" -- nonprod and prod only.
+KNOWN_ENVIRONMENTS = ("nonprod", "prod")
+_ENV_DIR = Path(__file__).resolve().parent / "environments"
+
+
+# ---------------------------------------------------------------------------
+# committed, PR-controlled operational config loader
+# ---------------------------------------------------------------------------
+def load_env_file(app_env: str | None = None) -> None:
+    """Load ``environments/<APP_ENV>.env`` as operational DEFAULTS.
+
+    These committed, per-environment files hold NON-SECRET operational config
+    (avenue toggles, risk tier, caps, behaviour flags) so that changing them is
+    a reviewable GitHub PR. Secrets are NEVER read from here -- they come from
+    Doppler.
+
+    Precedence: values are applied with :func:`os.environ.setdefault`, so any
+    real environment variable already present (injected by Doppler / CI /
+    shell) ALWAYS wins over the committed default.
+
+    Fully defensive: a missing/unreadable file is a no-op. An unknown APP_ENV
+    falls back to the nonprod file (the safe, paper-only default).
+    """
+    env = (app_env or os.environ.get("APP_ENV") or "nonprod").strip().lower() or "nonprod"
+    file_env = env if env in KNOWN_ENVIRONMENTS else "nonprod"
+    path = _ENV_DIR / f"{file_env}.env"
+    if not path.is_file():
+        logger.debug("no operational config file at %s (skipping)", path)
+        return
+    try:
+        for raw_line in path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            value = value.strip()
+            # strip an inline "  # comment" (only when preceded by whitespace)
+            for i in range(1, len(value)):
+                if value[i] == "#" and value[i - 1].isspace():
+                    value = value[:i].rstrip()
+                    break
+            # strip surrounding quotes
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning("could not read operational config %s: %s", path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +209,7 @@ class Config:
     """Top-level resolved configuration for a bot run."""
 
     # environment / trading mode
-    app_env: str = "nonprod"          # nonprod | staging | prod
+    app_env: str = "nonprod"          # nonprod | prod
     paper_trading: bool = True
     live_trading: bool = False
 
@@ -195,9 +252,20 @@ class Config:
         """Round-trip taker fees for a position of ``size`` notional."""
         return size * 2 * self.taker_fee_pct
 
+    @property
+    def is_live_capable_env(self) -> bool:
+        """prod is the ONLY environment permitted to touch the live account.
+        Being live-capable does not mean it IS live -- see :meth:`is_live`."""
+        return self.app_env == "prod"
+
     def is_live(self) -> bool:
-        """Live trading requires ALL THREE guards. Any other APP_ENV forces
-        paper trading regardless of the LIVE_TRADING setting."""
+        """Live trading requires ALL THREE guards:
+        ``APP_ENV=prod`` AND ``PAPER_TRADING=false`` AND ``LIVE_TRADING=true``.
+
+        nonprod (or any non-prod APP_ENV) can NEVER be live: the first guard
+        fails, so PAPER_TRADING/LIVE_TRADING are irrelevant and paper is forced.
+        prod defaults to paper too -- going live is an explicit, reviewable flip
+        of the two mode flags in ``environments/prod.env``."""
         return (
             self.app_env == "prod"
             and self.paper_trading is False
@@ -207,6 +275,9 @@ class Config:
     # ---- construction ----------------------------------------------------
     @classmethod
     def from_env(cls) -> "Config":
+        # Load committed, PR-controlled operational defaults for this APP_ENV
+        # FIRST (setdefault -> real env / Doppler still wins), then resolve.
+        load_env_file()
         app_env = os.environ.get("APP_ENV", "nonprod").strip().lower() or "nonprod"
         risk_tier = os.environ.get("RISK_TIER", "moderate").strip().lower() or "moderate"
         return cls(
@@ -245,6 +316,12 @@ class Config:
         if self.app_env == "prod" and self.paper_trading is False and self.live_trading:
             # live trading is intentional here; nothing to warn about
             pass
+        elif self.app_env != "prod" and (self.paper_trading is False or self.live_trading):
+            # Non-prod can never go live; the flags are ignored and paper forced.
+            problems.append(
+                f"LIVE_TRADING/PAPER_TRADING ignored in APP_ENV='{self.app_env}': "
+                "only APP_ENV=prod can trade live; forcing paper."
+            )
 
         return problems
 

@@ -9,11 +9,11 @@ variable "do_token" {
 }
 
 variable "environment" {
-  description = "Deployment environment: nonprod | staging | prod."
+  description = "Deployment environment: nonprod | prod."
   type        = string
   validation {
-    condition     = contains(["nonprod", "staging", "prod"], var.environment)
-    error_message = "environment must be one of: nonprod, staging, prod."
+    condition     = contains(["nonprod", "prod"], var.environment)
+    error_message = "environment must be one of: nonprod, prod."
   }
 }
 
