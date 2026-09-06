@@ -26,7 +26,7 @@ opened in the firewall.
 
 ## Environments
 
-Three environments — `nonprod`, `staging`, `prod` — are separated by OpenTofu
+Two environments — `nonprod`, `prod` — are separated by OpenTofu
 workspaces and per-env backend keys / tfvars.
 
 ```bash

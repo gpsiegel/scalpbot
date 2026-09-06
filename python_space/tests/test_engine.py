@@ -232,7 +232,7 @@ def test_mode_paper_by_default(session_factory):
 
 def test_live_requires_all_guards():
     assert _cfg(app_env="prod", paper_trading=False, live_trading=True).is_live()
-    assert not _cfg(app_env="staging", paper_trading=False, live_trading=True).is_live()
+    assert not _cfg(app_env="dev", paper_trading=False, live_trading=True).is_live()
     assert not _cfg(app_env="prod", paper_trading=True, live_trading=True).is_live()
 
 

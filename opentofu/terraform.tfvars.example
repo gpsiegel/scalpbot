@@ -7,7 +7,7 @@
 #   export TF_VAR_ssh_public_key="$DEPLOY_SSH_PUBKEY"
 # =============================================================================
 
-environment   = "nonprod" # nonprod | staging | prod
+environment   = "nonprod" # nonprod | prod
 region        = "nyc3"
 droplet_size  = "s-1vcpu-2gb"
 droplet_image = "ubuntu-24-04-x64"
@@ -19,7 +19,7 @@ enable_backups = true
 # Provide via TF_VAR_ssh_public_key in CI instead of committing:
 # ssh_public_key = "ssh-ed25519 AAAA... deploy@scalpbot"
 
-# Lock down in staging/prod to your admin + CI egress ranges.
+# Lock down in prod to your admin + CI egress ranges.
 allowed_ssh_cidrs = ["0.0.0.0/0", "::/0"]
 
 tags = []

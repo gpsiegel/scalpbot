@@ -21,6 +21,7 @@ unless APP_ENV=prod AND PAPER_TRADING=false AND LIVE_TRADING=true.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ from sentiment.aggregator import SentimentAggregator
 from . import avenues as av
 from . import options as opt
 from .alpaca_client import AlpacaClient
+from .groq_advisor import GroqAdvisor
+from .risk import TierParams, ev_positive, get_tier
 from .models import (
     MARKET_CRYPTO,
     MARKET_OPTION,
@@ -49,8 +52,164 @@ from .models import (
 
 logger = logging.getLogger("scalpbot.engine")
 
-# Per-position sizing (operational tunable -> plain .env).
+# Per-position sizing (operational tunable -> plain .env). Superseded per-trade
+# by the active risk tier's ``position_budget_usd``; kept as a global fallback.
 POSITION_BUDGET_USD = float(os.environ.get("POSITION_BUDGET_USD", "100") or "100")
+
+
+def _utcnow() -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+class ConsecutiveLossTracker:
+    """Circuit breaker: pause a market after too many consecutive losses.
+
+    Scalping's fastest way to ruin is revenge-trading a losing streak. This
+    tracker counts *consecutive* losing closes per market (in memory) and, once
+    the streak hits :data:`LOSS_THRESHOLD`, writes a cooldown timestamp
+    :data:`COOLDOWN_MINUTES` into the future to the persistent ``bot_config``
+    table. While ``is_cooling_down`` is True the engine opens no new positions in
+    that market. A single winning close resets the streak; the cooldown itself
+    simply expires with the clock.
+    """
+
+    COOLDOWN_MINUTES = 60
+    LOSS_THRESHOLD = 3
+    KEY_PREFIX = "cooldown_until_"
+    LOSS_PREFIX = "consec_losses_"
+
+    def __init__(self) -> None:
+        # in-memory consecutive-loss counts per market
+        self._counts: Dict[str, int] = {}
+
+    def record_win(self, market: str) -> None:
+        """A winning close breaks the streak."""
+        self._counts[market] = 0
+
+    def record_loss(self, market: str, session) -> None:
+        """A losing close extends the streak; trip the breaker at the threshold."""
+        self._counts[market] = self._counts.get(market, 0) + 1
+        if self._counts[market] >= self.LOSS_THRESHOLD:
+            self._set_cooldown(market, session)
+            self._counts[market] = 0  # reset streak once the breaker trips
+
+    def is_cooling_down(self, market: str, session) -> bool:
+        """True while a cooldown timestamp for ``market`` is still in the future."""
+        row = (
+            session.query(BotConfig)
+            .filter_by(key=f"{self.KEY_PREFIX}{market}")
+            .first()
+        )
+        if row is None or not row.value:
+            return False
+        try:
+            until = _dt.datetime.fromisoformat(row.value)
+        except ValueError:
+            return False
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=_dt.timezone.utc)
+        return _utcnow() < until
+
+    def _set_cooldown(self, market: str, session) -> None:
+        until = _utcnow() + _dt.timedelta(minutes=self.COOLDOWN_MINUTES)
+        key = f"{self.KEY_PREFIX}{market}"
+        row = session.query(BotConfig).filter_by(key=key).first()
+        if row is None:
+            session.add(BotConfig(key=key, value=until.isoformat(), market=market))
+        else:
+            row.value = until.isoformat()
+        logger.warning(
+            "consecutive-loss circuit breaker tripped for %s: cooling down until %s",
+            market,
+            until.isoformat(),
+        )
+
+
+class ConfidenceGate:
+    """Paper-validate a tier before it is allowed to place real orders.
+
+    When a (market, tier) pair first runs -- or whenever the active tier changes
+    -- the gate opens and the next :data:`PAPER_TRADES` closes are taken as paper
+    trades and tallied. If at least :data:`WINS_REQUIRED` of them win, the gate
+    passes (closes) and the market may trade for real under that tier. If the
+    validation window fills without enough wins, the tally resets and another
+    paper window begins. State lives in the persistent ``bot_config`` table so it
+    survives restarts.
+    """
+
+    PAPER_TRADES = 5
+    WINS_REQUIRED = 3
+    ACTIVE_PREFIX = "gate_active_"
+    WINS_PREFIX = "gate_wins_"
+    TOTAL_PREFIX = "gate_total_"
+    TIER_PREFIX = "gate_tier_"
+
+    def _get(self, session, key: str) -> Optional[str]:
+        row = session.query(BotConfig).filter_by(key=key).first()
+        return row.value if row else None
+
+    def _set(self, session, key: str, value: str, market: str) -> None:
+        row = session.query(BotConfig).filter_by(key=key).first()
+        if row is None:
+            session.add(BotConfig(key=key, value=value, market=market))
+        else:
+            row.value = value
+
+    def initialize_if_needed(self, market: str, tier: TierParams, session) -> None:
+        """Open a fresh validation window when unset or when the tier changed."""
+        active = self._get(session, f"{self.ACTIVE_PREFIX}{market}")
+        current_tier = self._get(session, f"{self.TIER_PREFIX}{market}")
+        if active is None or current_tier != tier.name:
+            self.reset(market, session)
+            self._set(session, f"{self.TIER_PREFIX}{market}", tier.name, market)
+
+    def reset(self, market: str, session) -> None:
+        """(Re)open the validation window: active, zero wins, zero total."""
+        self._set(session, f"{self.ACTIVE_PREFIX}{market}", "1", market)
+        self._set(session, f"{self.WINS_PREFIX}{market}", "0", market)
+        self._set(session, f"{self.TOTAL_PREFIX}{market}", "0", market)
+
+    def is_active(self, market: str, tier: TierParams, session) -> bool:
+        """True while the tier is still being paper-validated for ``market``."""
+        self.initialize_if_needed(market, tier, session)
+        return self._get(session, f"{self.ACTIVE_PREFIX}{market}") == "1"
+
+    def record_paper_trade(
+        self, market: str, tier: TierParams, won: bool, session
+    ) -> bool:
+        """Record one paper-trade outcome; return True if the gate just passed.
+
+        Fills the validation window; at :data:`PAPER_TRADES` trades it either
+        passes (>= :data:`WINS_REQUIRED` wins -> gate closes) or resets for
+        another window.
+        """
+        self.initialize_if_needed(market, tier, session)
+        wins = int(self._get(session, f"{self.WINS_PREFIX}{market}") or "0")
+        total = int(self._get(session, f"{self.TOTAL_PREFIX}{market}") or "0")
+        wins += 1 if won else 0
+        total += 1
+
+        if total >= self.PAPER_TRADES:
+            if wins >= self.WINS_REQUIRED:
+                self._set(session, f"{self.ACTIVE_PREFIX}{market}", "0", market)
+                self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
+                self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
+                logger.info(
+                    "confidence gate PASSED for %s tier=%s (%d/%d wins)",
+                    market, tier.name, wins, total,
+                )
+                return True
+            # window filled without enough wins -> reset and try again
+            self.reset(market, session)
+            logger.info(
+                "confidence gate reset for %s tier=%s (%d/%d wins, retrying)",
+                market, tier.name, wins, total,
+            )
+            return False
+
+        self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
+        self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
+        return False
 
 
 @dataclass
@@ -88,15 +247,71 @@ class TradingEngine:
         session_factory=None,
         alpaca: Optional[AlpacaClient] = None,
         aggregator: Optional[SentimentAggregator] = None,
+        tier: Optional[TierParams] = None,
+        groq: Optional[GroqAdvisor] = None,
     ):
         self.config = config or get_config()
         self.session_factory = session_factory or make_session_factory()
         self.aggregator = aggregator or SentimentAggregator()
+        # Active risk tier (resolved from RISK_TIER via config) and the Groq
+        # advisor. Both are injectable so tests can substitute fakes.
+        self.tier = tier or get_tier(self.config.risk_tier)
+        self.groq = groq or GroqAdvisor()
+        # Risk-management state machines.
+        self.loss_tracker = ConsecutiveLossTracker()
+        self.conf_gate = ConfidenceGate()
         # Construct the Alpaca client against the correct endpoint if not given.
         if alpaca is not None:
             self.alpaca = alpaca
         else:
             self.alpaca = AlpacaClient(paper=not self.config.is_live(), lazy=True)
+
+    # -- risk gates ---------------------------------------------------------
+    def _passes_entry_gates(self, session, market, symbol, score, tp, sl):
+        """Run the tier + cooldown + Groq + confidence-floor + EV gates.
+
+        Returns ``(ok, reason, paper_only)``:
+
+        * ``ok`` -- whether an entry may be taken at all;
+        * ``reason`` -- human-readable skip/accept reason (for logs);
+        * ``paper_only`` -- when True the position must be opened as a paper
+          trade (no real order) because the confidence gate is still validating
+          this tier for ``market``.
+        """
+        # 1) consecutive-loss circuit breaker
+        if self.loss_tracker.is_cooling_down(market, session):
+            return False, "cooldown active after consecutive losses", False
+        # 2) tier conviction gate (stricter than the avenue's base threshold)
+        if abs(score) < self.tier.entry_score_threshold:
+            return (
+                False,
+                f"score {score:.3f} below tier gate {self.tier.entry_score_threshold:.2f}",
+                False,
+            )
+        # 3) + 4) Groq advisor confidence floor and EV projection gate. Both
+        # depend on the advisor's verdict, so they are only enforced when Groq is
+        # configured. With no GROQ_API_KEY the advisor is disabled and the engine
+        # falls back to sentiment-only entries (the pre-advisor behaviour).
+        if not self.groq.is_disabled:
+            advice = self.groq.validate_trade(market, symbol, score, self.tier)
+            # 3) Groq advisor confidence floor
+            if advice.confidence < self.tier.groq_confidence_min:
+                return (
+                    False,
+                    f"groq confidence {advice.confidence:.2f} < {self.tier.groq_confidence_min:.2f}",
+                    False,
+                )
+            # 4) expected-value projection gate (must clear fee drag)
+            round_trip_fee = self.config.taker_fee_pct * 2
+            if not ev_positive(tp, sl, advice.projected_win_probability, round_trip_fee):
+                return (
+                    False,
+                    f"negative EV (win_prob {advice.projected_win_probability:.2f}) after fees",
+                    False,
+                )
+        # 5) confidence gate -- paper-validate the tier before real orders
+        paper_only = self.conf_gate.is_active(market, self.tier, session)
+        return True, "risk gates passed", paper_only
 
     @property
     def mode(self) -> str:
@@ -155,6 +370,8 @@ class TradingEngine:
                 decision = av.linear_exit_decision(
                     MARKET_CRYPTO, pos.symbol, pos.side,
                     pos.entry_price, price, sent.score,
+                    take_profit_pct=self.tier.crypto_take_profit_pct,
+                    stop_loss_pct=self.tier.crypto_stop_loss_pct,
                 )
                 if decision.is_close:
                     self._close_position(session, pos, price, decision.reason)
@@ -179,11 +396,23 @@ class TradingEngine:
                     continue
                 decision = av.crypto_entry_decision(symbol, sent.score)
                 if decision.is_open:
+                    ok, reason, paper_only = self._passes_entry_gates(
+                        session, MARKET_CRYPTO, symbol, sent.score,
+                        self.tier.crypto_take_profit_pct,
+                        self.tier.crypto_stop_loss_pct,
+                    )
+                    if not ok:
+                        report.skipped += 1
+                        self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                        continue
                     price = self.alpaca.get_crypto_price(symbol)
                     if price:
-                        self._open_position(session, MARKET_CRYPTO, symbol, decision, price)
+                        self._open_position(
+                            session, MARKET_CRYPTO, symbol, decision, price,
+                            place_order=not paper_only,
+                        )
                         report.opened += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, True)
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, True, reason)
                 else:
                     report.skipped += 1
                     self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
@@ -217,6 +446,8 @@ class TradingEngine:
                 decision = av.linear_exit_decision(
                     MARKET_STOCK, pos.symbol, pos.side,
                     pos.entry_price, price, sent.score,
+                    take_profit_pct=self.tier.stock_take_profit_pct,
+                    stop_loss_pct=self.tier.stock_stop_loss_pct,
                 )
                 if decision.is_close:
                     self._close_position(session, pos, price, decision.reason)
@@ -236,11 +467,23 @@ class TradingEngine:
                     continue
                 decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
                 if decision.is_open:
+                    ok, reason, paper_only = self._passes_entry_gates(
+                        session, MARKET_STOCK, ticker, sent.score,
+                        self.tier.stock_take_profit_pct,
+                        self.tier.stock_stop_loss_pct,
+                    )
+                    if not ok:
+                        report.skipped += 1
+                        self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                        continue
                     price = self.alpaca.get_stock_price(ticker)
                     if price:
-                        self._open_position(session, MARKET_STOCK, ticker, decision, price)
+                        self._open_position(
+                            session, MARKET_STOCK, ticker, decision, price,
+                            place_order=not paper_only,
+                        )
                         report.opened += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, True)
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, True, reason)
                 else:
                     report.skipped += 1
                     self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
@@ -303,13 +546,27 @@ class TradingEngine:
                     report.skipped += 1
                     self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
                     continue
-                n = opt.contracts_for_budget(choice.premium, POSITION_BUDGET_USD)
+                # risk gates: cooldown, tier conviction, Groq, EV. For options the
+                # EV projection uses the tier's premium profit target vs. the -35%
+                # premium stop encoded in the options ladder.
+                ok, reason, paper_only = self._passes_entry_gates(
+                    session, MARKET_OPTION, underlying, sent.score,
+                    self.tier.option_profit_target_pct, abs(opt.STOP_LOSS),
+                )
+                if not ok:
+                    report.skipped += 1
+                    self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, reason)
+                    continue
+                n = opt.contracts_for_budget(choice.premium, self.tier.position_budget_usd)
                 if n < 1:
                     report.skipped += 1
                     continue
-                self._open_option_position(session, underlying, side, choice, n, sent.score)
+                self._open_option_position(
+                    session, underlying, side, choice, n, sent.score,
+                    place_order=not paper_only,
+                )
                 report.opened += 1
-                self._log_signal(session, MARKET_OPTION, choice.contract.symbol, sent.score, sent.label, True)
+                self._log_signal(session, MARKET_OPTION, choice.contract.symbol, sent.score, sent.label, True, reason)
 
             session.commit()
         except Exception as exc:  # pragma: no cover - defensive
@@ -333,10 +590,13 @@ class TradingEngine:
         return self._count_open(session, market) < per_market
 
     # -- position lifecycle -------------------------------------------------
-    def _open_position(self, session, market, symbol, decision, price):
-        qty = POSITION_BUDGET_USD / price if price else 0.0
+    def _open_position(self, session, market, symbol, decision, price, place_order: bool = True):
+        # size with the active risk tier's per-position budget
+        budget = self.tier.position_budget_usd
+        qty = budget / price if price else 0.0
         notional = qty * price
         fees = self.config.round_trip_fees(notional) / 2  # entry side only
+        gate_mode = self.mode if place_order else "paper"
         pos = Position(
             market=market, symbol=symbol, side=decision.side, qty=qty,
             leverage=1.0, entry_price=price, current_price=price,
@@ -347,9 +607,12 @@ class TradingEngine:
         session.add(Trade(
             market=market, symbol=symbol, side=decision.side, action="open",
             qty=qty, price=price, notional=notional, fees=fees,
-            status=TRADE_FILLED, mode=self.mode, reason=decision.reason,
+            status=TRADE_FILLED, mode=gate_mode, reason=decision.reason,
         ))
-        # place the real order (paper or live per endpoint)
+        # place the real order (paper or live per endpoint). When the confidence
+        # gate is still validating this tier, skip the order entirely (paper-only).
+        if not place_order:
+            return
         if market == MARKET_CRYPTO:
             self.alpaca.submit_crypto_order(symbol, "buy", qty)
         else:
@@ -372,8 +635,23 @@ class TradingEngine:
             self.alpaca.submit_crypto_order(pos.symbol, "sell", pos.qty)
         else:
             self.alpaca.submit_stock_order(pos.symbol, "sell" if pos.side == "long" else "buy", pos.qty)
+        self._record_outcome(session, pos.market, pos.realized_pnl)
 
-    def _open_option_position(self, session, underlying, side, choice, contracts, score):
+    def _record_outcome(self, session, market: str, realized_pnl: float) -> None:
+        """Feed a closed trade's result into the risk state machines.
+
+        Updates the consecutive-loss circuit breaker and, while the confidence
+        gate is still validating this tier, tallies the paper-trade outcome.
+        """
+        won = (realized_pnl or 0.0) > 0
+        if won:
+            self.loss_tracker.record_win(market)
+        else:
+            self.loss_tracker.record_loss(market, session)
+        if self.conf_gate.is_active(market, self.tier, session):
+            self.conf_gate.record_paper_trade(market, self.tier, won, session)
+
+    def _open_option_position(self, session, underlying, side, choice, contracts, score, place_order: bool = True):
         premium = choice.premium
         cost = premium * opt.CONTRACT_MULTIPLIER * contracts
         pos = Position(
@@ -388,10 +666,12 @@ class TradingEngine:
         session.add(Trade(
             market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
             action="open", qty=contracts, price=premium, notional=cost, fees=0.0,
-            status=TRADE_FILLED, mode=self.mode,
+            status=TRADE_FILLED, mode=self.mode if place_order else "paper",
             reason=f"{side} entry, score {score:.3f}",
         ))
-        self.alpaca.submit_option_order(choice.contract.symbol, "buy", contracts)
+        # skip the real order while the confidence gate is paper-validating.
+        if place_order:
+            self.alpaca.submit_option_order(choice.contract.symbol, "buy", contracts)
 
     def _close_option_position(self, session, pos: Position, current_premium: float, action: str):
         contracts = pos.leverage or pos.qty
@@ -408,6 +688,7 @@ class TradingEngine:
             fees=0.0, pnl=pnl, status=TRADE_FILLED, mode=self.mode, reason=action,
         ))
         self.alpaca.submit_option_order(pos.symbol, "sell", int(contracts))
+        self._record_outcome(session, pos.market, pos.realized_pnl)
 
     # -- convenience --------------------------------------------------------
     def ensure_schema(self):

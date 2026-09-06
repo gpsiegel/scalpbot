@@ -66,7 +66,7 @@ def test_crypto_symbol_and_fees():
         ("prod", "false", "true", True),    # all three guards satisfied
         ("prod", "true", "true", False),    # paper still on
         ("prod", "false", "false", False),  # live flag off
-        ("staging", "false", "true", False),  # wrong env forces paper
+        ("dev", "false", "true", False),  # non-prod env forces paper
         ("nonprod", "false", "true", False),  # wrong env forces paper
     ],
 )

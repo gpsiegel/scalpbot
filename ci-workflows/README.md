@@ -27,7 +27,7 @@ migration so it can commit them directly.)
 
 ## Required GitHub Environment secrets
 
-Add for each environment (`nonprod` / `staging` / `prod`):
+Add for each environment (`nonprod` / `prod`):
 
 - `DIGITALOCEAN_TOKEN`
 - `DEPLOY_SSH_PUBKEY`, `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `RESERVED_IPV4`

@@ -20,7 +20,7 @@ on:
         required: true
         default: nonprod
         type: choice
-        options: [nonprod, staging, prod]
+        options: [nonprod, prod]
 
 permissions:
   contents: read
