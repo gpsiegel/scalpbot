@@ -133,19 +133,28 @@ def linear_exit_decision(
     entry_price: float,
     current_price: float,
     score: float,
+    take_profit_pct: Optional[float] = None,
+    stop_loss_pct: Optional[float] = None,
 ) -> AvenueDecision:
-    """Exit logic shared by crypto and stock (price + sentiment reversal)."""
+    """Exit logic shared by crypto and stock (price + sentiment reversal).
+
+    ``take_profit_pct`` / ``stop_loss_pct`` let the engine pass the *active risk
+    tier's* thresholds per call. When omitted they fall back to the module-level
+    globals, preserving the original behaviour (and existing tests).
+    """
+    tp = TAKE_PROFIT_PCT if take_profit_pct is None else take_profit_pct
+    sl = STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
     pnl = position_pnl_pct(side, entry_price, current_price)
 
-    if pnl >= TAKE_PROFIT_PCT:
+    if pnl >= tp:
         return AvenueDecision(
             action="close", market=market, symbol=symbol, side=side, score=score,
-            reason=f"take profit {pnl*100:.2f}% >= {TAKE_PROFIT_PCT*100:.2f}%",
+            reason=f"take profit {pnl*100:.2f}% >= {tp*100:.2f}%",
         )
-    if pnl <= -STOP_LOSS_PCT:
+    if pnl <= -sl:
         return AvenueDecision(
             action="close", market=market, symbol=symbol, side=side, score=score,
-            reason=f"stop loss {pnl*100:.2f}% <= {-STOP_LOSS_PCT*100:.2f}%",
+            reason=f"stop loss {pnl*100:.2f}% <= {-sl*100:.2f}%",
         )
     # sentiment reversal
     if side == SIDE_LONG and score < SENTIMENT_FLIP - CRYPTO_ENTRY_SCORE:

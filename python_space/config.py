@@ -174,6 +174,10 @@ class Config:
     # fees
     taker_fee_pct: float = 0.0025  # 0.25% per side
 
+    # risk profile (resolved to a TierParams bundle via engine.risk.get_tier).
+    # Non-secret operational tunable -> lives in plain .env as RISK_TIER.
+    risk_tier: str = "moderate"    # conservative | moderate | high
+
     # ---- derived helpers -------------------------------------------------
     @property
     def all_crypto_coins(self) -> List[str]:
@@ -204,8 +208,10 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         app_env = os.environ.get("APP_ENV", "nonprod").strip().lower() or "nonprod"
+        risk_tier = os.environ.get("RISK_TIER", "moderate").strip().lower() or "moderate"
         return cls(
             app_env=app_env,
+            risk_tier=risk_tier,
             paper_trading=_get_bool("PAPER_TRADING", True),
             live_trading=_get_bool("LIVE_TRADING", False),
             avenues=AvenueToggles.from_env(),
