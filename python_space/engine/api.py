@@ -7,21 +7,28 @@ Security model
 * **API key**: every *state-changing* endpoint requires the ``X-API-Key``
   header to match ``SCALPBOT_API_KEY`` (a Doppler secret). Read-only endpoints
   (``/health``, ``/status``, ``/positions``) are open on loopback.
-* **Live-trading confirmation**: flipping to live mode is a two-step handshake.
-  ``GET /confirmation-token`` (authenticated) mints a short-lived token; that
-  exact token must be echoed back to ``POST /mode`` to authorize a live switch.
-  This makes an accidental single request incapable of enabling live trading.
+* **Mode changes require a restart, not an API call**: ``TradingEngine.alpaca``
+  (the ``AlpacaClient``) is constructed once at startup against the paper/live
+  endpoint matching ``Config.is_live()`` *at that time*. Reloading ``Config``
+  alone does not rebuild it, so accepting a runtime app_env/paper_trading/
+  live_trading change here would silently desync the two: trades could be
+  labeled "live" while still hitting the paper endpoint, or -- far worse --
+  labeled "paper" while actually hitting the live endpoint. ``POST /mode``
+  therefore only ever *reports* the current mode; any request that would
+  actually change ``app_env``, ``paper_trading``, or ``live_trading`` is
+  rejected with 409. Going live is still exactly what ``config.Config.is_live``
+  documents: an explicit, reviewable flip of ``environments/prod.env``,
+  applied by restarting the process.
 
 Endpoints requiring ``X-API-Key``:
   POST /run-cycle, POST /stocks/run-cycle, POST /options/run-cycle,
-  POST /config, POST /mode, GET /confirmation-token
+  POST /config, POST /mode
 """
 from __future__ import annotations
 
 import logging
 import os
 import secrets
-import time
 from typing import Optional
 
 try:
@@ -31,22 +38,16 @@ except ImportError:  # pragma: no cover - allows import without fastapi installe
     FastAPI = None  # type: ignore
     BaseModel = object  # type: ignore
 
-from config import get_config
 from .engine import TradingEngine
 from .models import Position, POSITION_OPEN
 
 logger = logging.getLogger("scalpbot.engine.api")
-
-# Confirmation tokens for live-mode switches: token -> expiry epoch.
-_CONFIRM_TOKENS: dict[str, float] = {}
-_CONFIRM_TTL_SECONDS = 120
 
 
 class ModeRequest(BaseModel):
     app_env: Optional[str] = None
     paper_trading: Optional[bool] = None
     live_trading: Optional[bool] = None
-    confirmation_token: Optional[str] = None
 
 
 class ConfigRequest(BaseModel):
@@ -138,37 +139,28 @@ def create_app(engine: Optional[TradingEngine] = None):
     def options_run_cycle(_: bool = Depends(key_dep)):
         return engine.run_options_cycle().as_dict()
 
-    @app.get("/confirmation-token")
-    def confirmation_token(_: bool = Depends(key_dep)):
-        token = secrets.token_urlsafe(24)
-        _CONFIRM_TOKENS[token] = time.time() + _CONFIRM_TTL_SECONDS
-        return {"confirmation_token": token, "ttl_seconds": _CONFIRM_TTL_SECONDS}
-
     @app.post("/mode")
     def set_mode(req: ModeRequest, _: bool = Depends(key_dep)):
-        # Determine whether this request is trying to ENABLE live trading.
-        wants_live = (
-            (req.app_env or engine.config.app_env) == "prod"
-            and req.paper_trading is False
-            and req.live_trading is True
-        )
-        if wants_live:
-            tok = req.confirmation_token
-            expiry = _CONFIRM_TOKENS.pop(tok, None) if tok else None
-            if not expiry or expiry < time.time():
-                raise HTTPException(
-                    status_code=428,
-                    detail="live switch requires a valid confirmation_token "
-                           "(GET /confirmation-token first)",
-                )
-        # Apply overrides to the environment, then reload config.
-        if req.app_env is not None:
-            os.environ["APP_ENV"] = req.app_env
-        if req.paper_trading is not None:
-            os.environ["PAPER_TRADING"] = "true" if req.paper_trading else "false"
-        if req.live_trading is not None:
-            os.environ["LIVE_TRADING"] = "true" if req.live_trading else "false"
-        engine.config = get_config(reload=True)
+        """Report the current mode. Never mutates it -- see the module
+        docstring: rebuilding Config without rebuilding engine.alpaca to
+        match could silently desync the two, so any request that would
+        actually change app_env/paper_trading/live_trading is rejected."""
+        if req.app_env is not None and req.app_env != engine.config.app_env:
+            raise HTTPException(
+                status_code=409,
+                detail="app_env cannot be changed at runtime; restart the "
+                       "process with the new APP_ENV instead",
+            )
+        if (
+            (req.paper_trading is not None and req.paper_trading != engine.config.paper_trading)
+            or (req.live_trading is not None and req.live_trading != engine.config.live_trading)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="paper_trading/live_trading cannot be changed at runtime "
+                       "(the Alpaca client is bound to the endpoint chosen at "
+                       "startup); restart the process with the new values instead",
+            )
         return {"mode": engine.mode, "is_live": engine.config.is_live()}
 
     @app.post("/config")
