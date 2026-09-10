@@ -21,6 +21,7 @@ from engine import avenues as av  # noqa: E402
 from engine import options as opt  # noqa: E402
 from engine.alpaca_client import OptionContract, OrderResult  # noqa: E402
 from engine.engine import MARKET_CRYPTO, MARKET_OPTION, MARKET_STOCK, TradingEngine  # noqa: E402
+from engine.groq_advisor import GroqAdvice  # noqa: E402
 from engine.models import (  # noqa: E402
     Base,
     Position,
@@ -50,6 +51,30 @@ class FakeAgg:
         )
 
 
+class FakeGroq:
+    """Fake GroqAdvisor: always "enabled" (is_disabled=False) and returns a
+    fixed verdict, so tests can exercise the entry-gate logic that consumes
+    the advisor's action/confidence/win-probability without any network."""
+
+    def __init__(self, action="enter", confidence=0.9, win_prob=0.9):
+        self.action = action
+        self.confidence = confidence
+        self.win_prob = win_prob
+        self.calls = []
+
+    @property
+    def is_disabled(self):
+        return False
+
+    def validate_trade(self, market, symbol, score, tier, extra_context=None):
+        self.calls.append(extra_context)
+        return GroqAdvice(
+            action=self.action, confidence=self.confidence,
+            projected_win_probability=self.win_prob,
+            reasoning="test verdict", risk_tier_fit="good", signal_strength="strong",
+        )
+
+
 class FakeAlpaca:
     """Fake Alpaca client for engine tests.
 
@@ -67,6 +92,8 @@ class FakeAlpaca:
         self.close_calls = 0
         self.held_qty: dict = {}
         self.option_quotes: dict = {}  # symbol -> (bid, ask), absent == no quote
+        self.atr_by_symbol: dict = {}  # symbol -> ATR, absent == no bar data (fallback to static pct)
+        self.recent_return_by_symbol: dict = {}  # symbol -> fractional return, absent == no bar data
         self.crypto_fee_pct = 0.0
         self._reject_next = False
         self._reject_error = "simulated rejection"
@@ -149,6 +176,12 @@ class FakeAlpaca:
     def list_positions(self):
         return []
 
+    def get_atr(self, symbol, market, period=14):
+        return self.atr_by_symbol.get(symbol)
+
+    def get_recent_return(self, symbol, market, days=5):
+        return self.recent_return_by_symbol.get(symbol)
+
 
 @pytest.fixture()
 def session_factory(tmp_path):
@@ -191,6 +224,19 @@ def test_linear_exit_take_profit_and_stop():
     assert sl.is_close and "stop loss" in sl.reason
     hold = av.linear_exit_decision("crypto", "SOL/USD", "long", 100.0, 100.5, 0.5)
     assert hold.action == "hold"
+
+
+def test_linear_exit_reversal_uses_given_threshold_not_a_fixed_default():
+    # score -0.20 reverses at the default fixed 0.15 threshold...
+    default = av.linear_exit_decision("crypto", "SOL/USD", "long", 100.0, 100.5, -0.20)
+    assert default.is_close and "reversed" in default.reason
+    # ...but a HIGH-tier position (which needed 0.30 conviction to open) is
+    # held instead: -0.20 hasn't reversed far enough against a 0.30 bar.
+    high_tier = av.linear_exit_decision(
+        "crypto", "SOL/USD", "long", 100.0, 100.5, -0.20,
+        reversal_threshold=0.30,
+    )
+    assert high_tier.action == "hold"
 
 
 def test_position_pnl_direction():
@@ -297,6 +343,87 @@ def test_manage_exits_alone_closes_on_take_profit(session_factory):
     r = e.manage_exits(MARKET_CRYPTO)
     assert r.closed >= 1
     assert _count_open(session_factory) == 0
+
+
+def test_atr_scaled_exit_uses_atr_not_static_pct(session_factory):
+    # moderate tier: crypto_take_profit_pct=0.06 (static fallback),
+    # crypto_tp_atr_mult=3.0. With no ATR data, a 5% move must NOT close...
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True},
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+
+    fake.price = 150.0 * 1.05
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 0
+
+    # ...but with ATR=1.0, tp distance = (1.0*3.0)/150.0 ~= 2% -- the same 5%
+    # move now clears the ATR-scaled target easily.
+    fake.atr_by_symbol["SOL/USD"] = 1.0
+    r2 = e.manage_exits(MARKET_CRYPTO)
+    assert r2.closed == 1
+
+
+def test_max_hold_time_exit_fires_regardless_of_pnl(session_factory):
+    import datetime as _dt
+
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(max_hold_minutes=60), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    stale_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=120)
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True}, opened_at=stale_time,
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+
+    # price unchanged (well within any tp/sl band) -- only the holding-time
+    # exit should fire.
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 1
+    s2 = session_factory()
+    trade = (
+        s2.query(Trade)
+        .filter(Trade.symbol == "SOL/USD", Trade.action == "close")
+        .first()
+    )
+    assert "max holding time" in trade.reason
+    s2.close()
+
+
+def test_max_hold_time_disabled_when_zero(session_factory):
+    import datetime as _dt
+
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(max_hold_minutes=0), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    ancient = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True}, opened_at=ancient,
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 0
 
 
 def test_total_cap_enforced(session_factory):
@@ -457,6 +584,36 @@ def test_rejected_open_creates_no_position_and_rejected_trade(session_factory):
     s.close()
 
 
+def test_stock_entry_fee_is_spread_only_no_taker_fee(session_factory):
+    # Stocks are commission-free at Alpaca -- entry_fees must reflect only the
+    # modeled spread, never the crypto taker fee.
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(), aggregator=FakeAgg(0.5))
+    s = session_factory()
+    decision = _open_position(MARKET_STOCK, "F", score=0.5)
+    status, _err = e._open_position(s, MARKET_STOCK, "F", decision, 100.0, place_order=True)
+    assert status == "opened"
+    pos = s.query(Position).filter(Position.symbol == "F").first()
+    expected = pos.entry_notional * e.config.costs.stock_half_spread_pct
+    assert pos.entry_fees == pytest.approx(expected)
+    s.close()
+
+
+def test_crypto_entry_fee_is_taker_fee_plus_spread(session_factory):
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(), aggregator=FakeAgg(0.5))
+    s = session_factory()
+    decision = _open_position(MARKET_CRYPTO, "SOL/USD", score=0.5)
+    status, _err = e._open_position(s, MARKET_CRYPTO, "SOL/USD", decision, 100.0, place_order=True)
+    assert status == "opened"
+    pos = s.query(Position).filter(Position.symbol == "SOL/USD").first()
+    expected = pos.entry_notional * (
+        e.config.costs.crypto_taker_fee_pct + e.config.costs.crypto_half_spread_pct
+    )
+    assert pos.entry_fees == pytest.approx(expected)
+    s.close()
+
+
 def test_rejected_close_leaves_position_open(session_factory):
     fake = FakeAlpaca(price=100.0)
     e = TradingEngine(config=_cfg(), session_factory=session_factory,
@@ -471,7 +628,7 @@ def test_rejected_close_leaves_position_open(session_factory):
     closed = e._close_position(s, pos, 105.0, "take profit")
     assert closed is False
     assert pos.status == POSITION_OPEN
-    assert e.loss_tracker._counts.get(MARKET_CRYPTO, 0) == 0
+    assert e.loss_tracker._get_count(MARKET_CRYPTO, s) == 0
     s.close()
 
 
@@ -560,6 +717,77 @@ def test_no_entry_when_sentiment_not_actionable(session_factory):
     logs = s.query(SignalLog).all()
     assert any("insufficient sentiment coverage" in (log.detail or "") for log in logs)
     s.close()
+
+
+# --------------------------------------------------------------------------
+# Groq advisor gating (backlog: action was previously ignored)
+# --------------------------------------------------------------------------
+def test_groq_non_enter_action_blocks_entry_despite_high_confidence(session_factory):
+    # Before this fix, only confidence/EV were checked -- a "hold" verdict
+    # with high confidence and a great win-prob would have opened a position.
+    groq = FakeGroq(action="hold", confidence=0.95, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    r = e.run_crypto_cycle()
+    assert r.opened == 0
+    assert len(groq.calls) > 0  # the advisor was actually consulted
+
+
+def test_groq_enter_action_allows_entry(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    r = e.run_crypto_cycle()
+    assert r.opened >= 1
+
+
+def test_groq_verdict_logged_for_calibration(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    s = session_factory()
+    logs = s.query(SignalLog).filter(SignalLog.acted == True).all()  # noqa: E712
+    assert any(
+        isinstance(log.detail, dict) and log.detail.get("groq_action") == "enter"
+        for log in logs
+    )
+    s.close()
+
+
+def test_groq_extra_context_includes_sentiment_coverage(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0),
+                      aggregator=FakeAgg(0.6, coverage=0.83), groq=groq)
+    e.run_crypto_cycle()
+    assert len(groq.calls) > 0
+    ctx = groq.calls[0]
+    assert ctx is not None
+    assert ctx["sentiment_coverage"] == pytest.approx(0.83)
+
+
+def test_groq_extra_context_includes_recent_return_and_atr_when_available(session_factory):
+    fake = FakeAlpaca(price=150.0)
+    fake.recent_return_by_symbol["SOL/USD"] = 0.045
+    fake.atr_by_symbol["SOL/USD"] = 3.2
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    ctx = groq.calls[0]
+    assert ctx["recent_return_5d_pct"] == pytest.approx(0.045)
+    assert ctx["atr"] == pytest.approx(3.2)
+
+
+def test_groq_extra_context_omits_recent_return_and_atr_when_unavailable(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    ctx = groq.calls[0]
+    assert "recent_return_5d_pct" not in ctx
+    assert "atr" not in ctx
 
 
 def test_reconcile_skips_simulated_position(session_factory):

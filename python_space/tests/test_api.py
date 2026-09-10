@@ -1,7 +1,9 @@
 """Tests for the control-plane API security model.
 
-Verifies that state-changing endpoints require X-API-Key and that switching to
-live mode requires a valid confirmation token.
+Verifies that state-changing endpoints require X-API-Key and that /mode never
+mutates app_env/paper_trading/live_trading at runtime (see engine/api.py's
+module docstring: the AlpacaClient is bound to the endpoint chosen at
+startup, so a live process reloading Config alone would desync the two).
 """
 from __future__ import annotations
 
@@ -99,23 +101,35 @@ def test_stocks_and_options_cycle_require_key(client):
     assert client.post("/options/run-cycle", headers=h).status_code == 200
 
 
-def test_live_switch_requires_confirmation_token(client):
+def test_mode_rejects_app_env_change(client):
     h = {"X-API-Key": "test-secret-key"}
-    # Without a token -> 428 Precondition Required.
+    r = client.post("/mode", headers=h, json={"app_env": "prod"})
+    assert r.status_code == 409
+
+
+def test_mode_rejects_live_switch_at_runtime(client):
+    h = {"X-API-Key": "test-secret-key"}
     r = client.post("/mode", headers=h, json={
         "app_env": "prod", "paper_trading": False, "live_trading": True,
     })
-    assert r.status_code == 428
+    assert r.status_code == 409
+    # config is untouched -- still nonprod/paper, no partial mutation happened.
+    assert client.get("/status").json()["is_live"] is False
 
-    # Mint a token, then the switch succeeds.
-    tok = client.get("/confirmation-token", headers=h).json()["confirmation_token"]
-    r2 = client.post("/mode", headers=h, json={
-        "app_env": "prod", "paper_trading": False, "live_trading": True,
-        "confirmation_token": tok,
+
+def test_mode_reports_current_mode_without_change(client):
+    h = {"X-API-Key": "test-secret-key"}
+    # Echoing back the current values (or sending none at all) is a no-op.
+    r = client.post("/mode", headers=h, json={
+        "app_env": "nonprod", "paper_trading": True, "live_trading": False,
     })
+    assert r.status_code == 200
+    assert r.json() == {"mode": "paper", "is_live": False}
+
+    r2 = client.post("/mode", headers=h, json={})
     assert r2.status_code == 200
-    assert r2.json()["is_live"] is True
+    assert r2.json() == {"mode": "paper", "is_live": False}
 
 
-def test_confirmation_token_requires_key(client):
-    assert client.get("/confirmation-token").status_code == 401
+def test_mode_requires_key(client):
+    assert client.post("/mode", json={}).status_code == 401

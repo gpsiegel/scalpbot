@@ -198,3 +198,84 @@ def test_get_option_quote_none_when_missing():
     client = _client(FakeTradingClient())
     client._option_data = FakeOptionDataClient()
     assert client.get_option_quote("NOPE") is None
+
+
+# --------------------------------------------------------------------------
+# backlog: volatility-scaled exits -- ATR fetch
+# --------------------------------------------------------------------------
+@dataclass
+class FakeBar:
+    high: float
+    low: float
+    close: float
+
+
+class FakeBarSet:
+    def __init__(self, data):
+        self.data = data  # {symbol: [FakeBar, ...]}
+
+
+class FakeStockDataClient:
+    def __init__(self, bars_by_symbol=None):
+        self.bars_by_symbol = bars_by_symbol or {}
+
+    def get_stock_bars(self, req):
+        symbol = req.symbol_or_symbols
+        return FakeBarSet({symbol: self.bars_by_symbol.get(symbol, [])})
+
+
+class FakeCryptoDataClient:
+    def __init__(self, bars_by_symbol=None):
+        self.bars_by_symbol = bars_by_symbol or {}
+
+    def get_crypto_bars(self, req):
+        symbol = req.symbol_or_symbols
+        return FakeBarSet({symbol: self.bars_by_symbol.get(symbol, [])})
+
+
+def test_get_atr_stock_computes_from_bars():
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(15)]
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_atr("PLTR", "stock", period=14) == pytest.approx(2.0)
+
+
+def test_get_atr_crypto_computes_from_bars():
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(15)]
+    client = _client(FakeTradingClient())
+    client._crypto_data = FakeCryptoDataClient({"SOL/USD": bars})
+    assert client.get_atr("SOL/USD", "crypto", period=14) == pytest.approx(2.0)
+
+
+def test_get_atr_none_on_insufficient_history():
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(5)]
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_atr("PLTR", "stock", period=14) is None
+
+
+def test_get_atr_never_raises_on_broker_error():
+    class RaisingStockData:
+        def get_stock_bars(self, req):
+            raise RuntimeError("data feed down")
+
+    client = _client(FakeTradingClient())
+    client._stock_data = RaisingStockData()
+    assert client.get_atr("PLTR", "stock", period=14) is None
+
+
+def test_get_recent_return_computes_pct_change():
+    # 6 bars (days=5 needs days+1=6): closes flat at 100 except the most
+    # recent bar closes at 103 -> +3% from 5 bars ago.
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(5)]
+    bars.append(FakeBar(high=104.0, low=102.0, close=103.0))
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_recent_return("PLTR", "stock", days=5) == pytest.approx(0.03)
+
+
+def test_get_recent_return_none_on_insufficient_history():
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(3)]
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_recent_return("PLTR", "stock", days=5) is None

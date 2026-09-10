@@ -40,7 +40,13 @@ def test_defaults():
     assert c.avenues.options is False
     assert c.caps.total == 3
     assert c.options.min_dte == 7
-    assert c.taker_fee_pct == 0.0025
+    assert c.costs.crypto_taker_fee_pct == 0.0025
+    assert c.max_hold_minutes == 240
+
+
+def test_max_hold_minutes_env_override(monkeypatch):
+    monkeypatch.setenv("MAX_HOLD_MINUTES", "30")
+    assert Config.from_env().max_hold_minutes == 30
 
 
 def test_list_parsing_upper_and_dedup(monkeypatch):
@@ -61,7 +67,13 @@ def test_all_crypto_coins_merges_core_and_satellite(monkeypatch):
 def test_crypto_symbol_and_fees():
     c = Config.from_env()
     assert c.crypto_symbol("sol") == "SOL/USD"
-    assert c.round_trip_fees(1000) == pytest.approx(5.0)  # 1000 * 2 * 0.0025
+    # crypto: taker fee + spread, both round-tripped -> 1000 * 2 * (0.0025 + 0.0005)
+    assert c.round_trip_fees("crypto", 1000) == pytest.approx(6.0)
+    # stocks: commission-free at Alpaca, spread only -> 1000 * 2 * 0.0005
+    assert c.round_trip_fees("stock", 1000) == pytest.approx(1.0)
+    # options: spread is already captured via ask/bid execution, not a
+    # separate fee -- only the (default-zero) regulatory fee applies here.
+    assert c.round_trip_fees("option", 1000) == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(

@@ -26,7 +26,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from config import Config, get_config
 from sentiment.aggregator import SentimentAggregator
@@ -83,11 +83,13 @@ class ConsecutiveLossTracker:
     """Circuit breaker: pause a market after too many consecutive losses.
 
     Scalping's fastest way to ruin is revenge-trading a losing streak. This
-    tracker counts *consecutive* losing closes per market (in memory) and, once
+    tracker counts *consecutive* losing closes per market, persisted in the
+    ``bot_config`` table (so a redeploy doesn't quietly reset the streak to
+    zero and hand back the very risk this breaker exists to catch) and, once
     the streak hits :data:`LOSS_THRESHOLD`, writes a cooldown timestamp
-    :data:`COOLDOWN_MINUTES` into the future to the persistent ``bot_config``
-    table. While ``is_cooling_down`` is True the engine opens no new positions in
-    that market. A single winning close resets the streak; the cooldown itself
+    :data:`COOLDOWN_MINUTES` into the future to that same table. While
+    ``is_cooling_down`` is True the engine opens no new positions in that
+    market. A single winning close resets the streak; the cooldown itself
     simply expires with the clock.
     """
 
@@ -96,20 +98,34 @@ class ConsecutiveLossTracker:
     KEY_PREFIX = "cooldown_until_"
     LOSS_PREFIX = "consec_losses_"
 
-    def __init__(self) -> None:
-        # in-memory consecutive-loss counts per market
-        self._counts: Dict[str, int] = {}
+    def _get_count(self, market: str, session) -> int:
+        row = session.query(BotConfig).filter_by(key=f"{self.LOSS_PREFIX}{market}").first()
+        if row is None or not row.value:
+            return 0
+        try:
+            return int(row.value)
+        except ValueError:
+            return 0
 
-    def record_win(self, market: str) -> None:
+    def _set_count(self, market: str, count: int, session) -> None:
+        key = f"{self.LOSS_PREFIX}{market}"
+        row = session.query(BotConfig).filter_by(key=key).first()
+        if row is None:
+            session.add(BotConfig(key=key, value=str(count), market=market))
+        else:
+            row.value = str(count)
+
+    def record_win(self, market: str, session) -> None:
         """A winning close breaks the streak."""
-        self._counts[market] = 0
+        self._set_count(market, 0, session)
 
     def record_loss(self, market: str, session) -> None:
         """A losing close extends the streak; trip the breaker at the threshold."""
-        self._counts[market] = self._counts.get(market, 0) + 1
-        if self._counts[market] >= self.LOSS_THRESHOLD:
+        count = self._get_count(market, session) + 1
+        if count >= self.LOSS_THRESHOLD:
             self._set_cooldown(market, session)
-            self._counts[market] = 0  # reset streak once the breaker trips
+            count = 0  # reset streak once the breaker trips
+        self._set_count(market, count, session)
 
     def is_cooling_down(self, market: str, session) -> bool:
         """True while a cooldown timestamp for ``market`` is still in the future."""
@@ -144,23 +160,40 @@ class ConsecutiveLossTracker:
 
 
 class ConfidenceGate:
-    """Paper-validate a tier before it is allowed to place real orders.
+    """Paper-validate a tier's after-fee expectancy before it is allowed to
+    place real orders.
 
-    When a (market, tier) pair first runs -- or whenever the active tier changes
-    -- the gate opens and the next :data:`PAPER_TRADES` closes are taken as paper
-    trades and tallied. If at least :data:`WINS_REQUIRED` of them win, the gate
-    passes (closes) and the market may trade for real under that tier. If the
-    validation window fills without enough wins, the tally resets and another
-    paper window begins. State lives in the persistent ``bot_config`` table so it
-    survives restarts.
+    A simple win-count tally is a weak statistical test: 3-of-5 wins passes
+    a coin flip about half the time, and a strategy with a true 35% win rate
+    (below break-even) still clears it roughly 74% of the time within a
+    handful of automatic retries. This gate instead tallies the actual
+    after-fee P&L (:attr:`Position.realized_pnl` is already net of fees/spread)
+    of the next :data:`TRADES_REQUIRED` paper closes for a (market, tier)
+    pair, and passes only if their sum is positive -- an actual expectancy
+    check, not a coin-flip-shaped proxy for one.
+
+    A window that ends with non-positive expectancy does **not**
+    automatically retry: the gate is marked failed and stays that way,
+    blocking real orders for this (market, tier) indefinitely. Clearing it
+    requires an operator to explicitly reset it: ``POST /config`` with
+    ``key=f"gate_reset_{market}"`` and any value that differs from what the
+    gate last saw (an incrementing counter or a timestamp both work -- the
+    gate only checks that the value changed). Switching ``RISK_TIER`` still
+    opens a fresh window automatically, since that's a deliberate operator
+    change to a different strategy, not a retry of the one that just failed.
+
+    State lives in the persistent ``bot_config`` table so it survives
+    restarts.
     """
 
-    PAPER_TRADES = 5
-    WINS_REQUIRED = 3
+    TRADES_REQUIRED = 30
     ACTIVE_PREFIX = "gate_active_"
-    WINS_PREFIX = "gate_wins_"
+    FAILED_PREFIX = "gate_failed_"
+    PNL_SUM_PREFIX = "gate_pnl_sum_"
     TOTAL_PREFIX = "gate_total_"
     TIER_PREFIX = "gate_tier_"
+    RESET_PREFIX = "gate_reset_"
+    RESET_SEEN_PREFIX = "gate_reset_seen_"
 
     def _get(self, session, key: str) -> Optional[str]:
         row = session.query(BotConfig).filter_by(key=key).first()
@@ -173,59 +206,85 @@ class ConfidenceGate:
         else:
             row.value = value
 
+    def _manual_reset_requested(self, market: str, session) -> bool:
+        """True (once) when an operator has POSTed a new gate_reset_<market>
+        value via /config since the gate last consumed one."""
+        reset_value = self._get(session, f"{self.RESET_PREFIX}{market}")
+        if reset_value is None:
+            return False
+        seen_value = self._get(session, f"{self.RESET_SEEN_PREFIX}{market}")
+        if reset_value == seen_value:
+            return False
+        self._set(session, f"{self.RESET_SEEN_PREFIX}{market}", reset_value, market)
+        return True
+
     def initialize_if_needed(self, market: str, tier: TierParams, session) -> None:
-        """Open a fresh validation window when unset or when the tier changed."""
+        """Open a fresh validation window when unset, the tier changed, or an
+        operator requested a manual reset."""
         active = self._get(session, f"{self.ACTIVE_PREFIX}{market}")
         current_tier = self._get(session, f"{self.TIER_PREFIX}{market}")
-        if active is None or current_tier != tier.name:
+        tier_changed = active is not None and current_tier != tier.name
+        manual_reset = self._manual_reset_requested(market, session)
+        if active is None or tier_changed or manual_reset:
             self.reset(market, session)
             self._set(session, f"{self.TIER_PREFIX}{market}", tier.name, market)
 
     def reset(self, market: str, session) -> None:
-        """(Re)open the validation window: active, zero wins, zero total."""
+        """(Re)open the validation window: active, not failed, zero tally."""
         self._set(session, f"{self.ACTIVE_PREFIX}{market}", "1", market)
-        self._set(session, f"{self.WINS_PREFIX}{market}", "0", market)
+        self._set(session, f"{self.FAILED_PREFIX}{market}", "0", market)
+        self._set(session, f"{self.PNL_SUM_PREFIX}{market}", "0.0", market)
         self._set(session, f"{self.TOTAL_PREFIX}{market}", "0", market)
 
     def is_active(self, market: str, tier: TierParams, session) -> bool:
-        """True while the tier is still being paper-validated for ``market``."""
+        """True while real orders are blocked for ``market``: either still
+        validating, or blocked after a failed window pending manual reset."""
         self.initialize_if_needed(market, tier, session)
+        if self._get(session, f"{self.FAILED_PREFIX}{market}") == "1":
+            return True
         return self._get(session, f"{self.ACTIVE_PREFIX}{market}") == "1"
 
     def record_paper_trade(
-        self, market: str, tier: TierParams, won: bool, session
+        self, market: str, tier: TierParams, realized_pnl: float, session
     ) -> bool:
-        """Record one paper-trade outcome; return True if the gate just passed.
+        """Record one paper-trade's after-fee P&L; return True if the gate
+        just passed.
 
-        Fills the validation window; at :data:`PAPER_TRADES` trades it either
-        passes (>= :data:`WINS_REQUIRED` wins -> gate closes) or resets for
-        another window.
+        Fills the validation window; at :data:`TRADES_REQUIRED` trades it
+        either passes (positive cumulative P&L -> gate closes) or fails
+        (marked failed, blocked until a manual reset -- see the class
+        docstring). A no-op once already failed: it does not keep
+        accumulating toward a retry the gate will never attempt on its own.
         """
         self.initialize_if_needed(market, tier, session)
-        wins = int(self._get(session, f"{self.WINS_PREFIX}{market}") or "0")
+        if self._get(session, f"{self.FAILED_PREFIX}{market}") == "1":
+            return False
+
+        pnl_sum = float(self._get(session, f"{self.PNL_SUM_PREFIX}{market}") or "0.0")
         total = int(self._get(session, f"{self.TOTAL_PREFIX}{market}") or "0")
-        wins += 1 if won else 0
+        pnl_sum += realized_pnl or 0.0
         total += 1
 
-        if total >= self.PAPER_TRADES:
-            if wins >= self.WINS_REQUIRED:
+        if total >= self.TRADES_REQUIRED:
+            self._set(session, f"{self.PNL_SUM_PREFIX}{market}", str(pnl_sum), market)
+            self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
+            if pnl_sum > 0:
                 self._set(session, f"{self.ACTIVE_PREFIX}{market}", "0", market)
-                self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
-                self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
                 logger.info(
-                    "confidence gate PASSED for %s tier=%s (%d/%d wins)",
-                    market, tier.name, wins, total,
+                    "confidence gate PASSED for %s tier=%s (avg pnl %.4f over %d trades)",
+                    market, tier.name, pnl_sum / total, total,
                 )
                 return True
-            # window filled without enough wins -> reset and try again
-            self.reset(market, session)
-            logger.info(
-                "confidence gate reset for %s tier=%s (%d/%d wins, retrying)",
-                market, tier.name, wins, total,
+            self._set(session, f"{self.ACTIVE_PREFIX}{market}", "0", market)
+            self._set(session, f"{self.FAILED_PREFIX}{market}", "1", market)
+            logger.warning(
+                "confidence gate FAILED for %s tier=%s (avg pnl %.4f over %d trades); "
+                "blocked until a manual reset via POST /config key=%s%s",
+                market, tier.name, pnl_sum / total, total, self.RESET_PREFIX, market,
             )
             return False
 
-        self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
+        self._set(session, f"{self.PNL_SUM_PREFIX}{market}", str(pnl_sum), market)
         self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
         return False
 
@@ -285,51 +344,100 @@ class TradingEngine:
             self.alpaca = AlpacaClient(paper=not self.config.is_live(), lazy=True)
 
     # -- risk gates ---------------------------------------------------------
-    def _passes_entry_gates(self, session, market, symbol, score, tp, sl):
+    def _passes_entry_gates(self, session, market, symbol, sent, tp, sl):
         """Run the tier + cooldown + Groq + confidence-floor + EV gates.
 
-        Returns ``(ok, reason, paper_only)``:
+        Returns ``(ok, reason, paper_only, detail)``:
 
         * ``ok`` -- whether an entry may be taken at all;
         * ``reason`` -- human-readable skip/accept reason (for logs);
         * ``paper_only`` -- when True the position must be opened as a paper
           trade (no real order) because the confidence gate is still validating
-          this tier for ``market``.
+          this tier for ``market``;
+        * ``detail`` -- ``None`` unless Groq actually ran, in which case a dict
+          of its full verdict (action/confidence/win-prob/reasoning/etc.) for
+          ``SignalLog.detail``, so every Groq call -- pass or fail -- is
+          recorded for later calibration, not just the ones that block a trade.
         """
+        score = sent.score
         # 1) consecutive-loss circuit breaker
         if self.loss_tracker.is_cooling_down(market, session):
-            return False, "cooldown active after consecutive losses", False
+            return False, "cooldown active after consecutive losses", False, None
         # 2) tier conviction gate (stricter than the avenue's base threshold)
         if abs(score) < self.tier.entry_score_threshold:
             return (
                 False,
                 f"score {score:.3f} below tier gate {self.tier.entry_score_threshold:.2f}",
                 False,
+                None,
             )
-        # 3) + 4) Groq advisor confidence floor and EV projection gate. Both
-        # depend on the advisor's verdict, so they are only enforced when Groq is
-        # configured. With no GROQ_API_KEY the advisor is disabled and the engine
-        # falls back to sentiment-only entries (the pre-advisor behaviour).
+        # 3)-5) Groq advisor endorsement, confidence floor, and EV projection
+        # gate. All depend on the advisor's verdict, so they are only enforced
+        # when Groq is configured. With no GROQ_API_KEY the advisor is
+        # disabled and the engine falls back to sentiment-only entries (the
+        # pre-advisor behaviour).
+        detail = None
         if not self.groq.is_disabled:
-            advice = self.groq.validate_trade(market, symbol, score, self.tier)
-            # 3) Groq advisor confidence floor
+            extra_context = {
+                "sentiment_coverage": round(sent.coverage, 4),
+                "sentiment_sources": {
+                    name: round(sig.score, 4)
+                    for name, sig in sent.signals.items()
+                    if sig.available
+                },
+            }
+            # Real momentum/volatility features, not just the sentiment
+            # score -- both best-effort (None when bar data isn't available,
+            # e.g. a brand-new listing) and simply omitted rather than sent
+            # as a placeholder. For options, `symbol` here is the underlying
+            # stock ticker, so these still resolve correctly.
+            recent_return = self.alpaca.get_recent_return(symbol, market)
+            if recent_return is not None:
+                extra_context["recent_return_5d_pct"] = round(recent_return, 4)
+            atr = self.alpaca.get_atr(symbol, market)
+            if atr is not None:
+                extra_context["atr"] = round(atr, 4)
+            advice = self.groq.validate_trade(
+                market, symbol, score, self.tier, extra_context=extra_context
+            )
+            detail = {
+                "groq_action": advice.action,
+                "groq_confidence": round(advice.confidence, 4),
+                "groq_win_prob": round(advice.projected_win_probability, 4),
+                "groq_reasoning": advice.reasoning,
+                "risk_tier_fit": advice.risk_tier_fit,
+                "signal_strength": advice.signal_strength,
+            }
+            # 3) the advisor must actively endorse entering. A "hold"/"skip"
+            # verdict -- including the neutral-hold every failure path
+            # returns -- must never open a position on its own.
+            if not advice.endorses_entry:
+                return (
+                    False,
+                    f"groq did not endorse entry (action={advice.action})",
+                    False,
+                    detail,
+                )
+            # 4) Groq advisor confidence floor
             if advice.confidence < self.tier.groq_confidence_min:
                 return (
                     False,
                     f"groq confidence {advice.confidence:.2f} < {self.tier.groq_confidence_min:.2f}",
                     False,
+                    detail,
                 )
-            # 4) expected-value projection gate (must clear fee drag)
-            round_trip_fee = self.config.taker_fee_pct * 2
+            # 5) expected-value projection gate (must clear fee + spread drag)
+            round_trip_fee = self.config.costs.round_trip_pct(market)
             if not ev_positive(tp, sl, advice.projected_win_probability, round_trip_fee):
                 return (
                     False,
                     f"negative EV (win_prob {advice.projected_win_probability:.2f}) after fees",
                     False,
+                    detail,
                 )
-        # 5) confidence gate -- paper-validate the tier before real orders
+        # 6) confidence gate -- paper-validate the tier before real orders
         paper_only = self.conf_gate.is_active(market, self.tier, session)
-        return True, "risk gates passed", paper_only
+        return True, "risk gates passed", paper_only, detail
 
     @property
     def mode(self) -> str:
@@ -383,13 +491,13 @@ class TradingEngine:
             )
         )
 
-    def _record_open_outcome(self, session, report, status, err, market, symbol, sent, reason):
+    def _record_open_outcome(self, session, report, status, err, market, symbol, sent, detail):
         """Translate an ``_open_position``/``_open_option_position`` result
-        (``"opened" | "skip" | "rejected"``, reason) into report counters and
-        a signal-log row, shared by all three cycles."""
+        (``"opened" | "skip" | "rejected"``, reason/detail) into report
+        counters and a signal-log row, shared by all three cycles."""
         if status == "opened":
             report.opened += 1
-            self._log_signal(session, market, symbol, sent.score, sent.label, True, reason)
+            self._log_signal(session, market, symbol, sent.score, sent.label, True, detail)
         elif status == "skip":
             report.skipped += 1
             self._log_signal(session, market, symbol, sent.score, sent.label, False, err)
@@ -450,6 +558,34 @@ class TradingEngine:
         return warnings
 
     # -- crypto -------------------------------------------------------------
+    def _atr_scaled_pcts(
+        self, symbol: str, market: str, price: float,
+        tp_mult: float, sl_mult: float,
+        fallback_tp: float, fallback_sl: float,
+    ) -> Tuple[float, float]:
+        """ATR-scaled take-profit/stop-loss as fractions of ``price``.
+
+        Falls back to the tier's static percentages when there isn't enough
+        bar history yet (new listing, data feed hiccup, etc.) -- volatility
+        scaling is strictly an improvement over the fixed percentage, never
+        a hard dependency the engine can't run without.
+        """
+        if not price:
+            return fallback_tp, fallback_sl
+        atr = self.alpaca.get_atr(symbol, market)
+        if not atr:
+            return fallback_tp, fallback_sl
+        return (atr * tp_mult) / price, (atr * sl_mult) / price
+
+    def _max_hold_exceeded(self, pos: Position) -> bool:
+        if not self.config.max_hold_minutes or not pos.opened_at:
+            return False
+        opened_at = pos.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
+        elapsed_minutes = (_utcnow() - opened_at).total_seconds() / 60.0
+        return elapsed_minutes >= self.config.max_hold_minutes
+
     def _manage_crypto_exits(self, session, report: CycleReport) -> None:
         for pos in self._open_positions(session, MARKET_CRYPTO):
             coin = pos.symbol.split("/")[0]
@@ -457,15 +593,24 @@ class TradingEngine:
             if price is None:
                 continue
             sent = self.aggregator.get_sentiment(coin)
+            tp_pct, sl_pct = self._atr_scaled_pcts(
+                pos.symbol, MARKET_CRYPTO, price,
+                self.tier.crypto_tp_atr_mult, self.tier.crypto_sl_atr_mult,
+                self.tier.crypto_take_profit_pct, self.tier.crypto_stop_loss_pct,
+            )
             decision = av.linear_exit_decision(
                 MARKET_CRYPTO, pos.symbol, pos.side,
                 pos.entry_price, price, sent.score,
-                take_profit_pct=self.tier.crypto_take_profit_pct,
-                stop_loss_pct=self.tier.crypto_stop_loss_pct,
+                take_profit_pct=tp_pct,
+                stop_loss_pct=sl_pct,
                 actionable=sent.actionable,
+                reversal_threshold=self.tier.entry_score_threshold,
             )
-            if decision.is_close:
-                if self._close_position(session, pos, price, decision.reason):
+            reason = decision.reason if decision.is_close else None
+            if reason is None and self._max_hold_exceeded(pos):
+                reason = f"max holding time exceeded ({self.config.max_hold_minutes}min)"
+            if reason:
+                if self._close_position(session, pos, price, reason):
                     report.closed += 1
                 else:
                     report.held += 1
@@ -497,14 +642,14 @@ class TradingEngine:
                 continue
             decision = av.crypto_entry_decision(symbol, sent.score)
             if decision.is_open:
-                ok, reason, paper_only = self._passes_entry_gates(
-                    session, MARKET_CRYPTO, symbol, sent.score,
+                ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                    session, MARKET_CRYPTO, symbol, sent,
                     self.tier.crypto_take_profit_pct,
                     self.tier.crypto_stop_loss_pct,
                 )
                 if not ok:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, gate_detail or reason)
                     continue
                 price = self.alpaca.get_crypto_price(symbol)
                 if price:
@@ -512,10 +657,10 @@ class TradingEngine:
                         session, MARKET_CRYPTO, symbol, decision, price,
                         place_order=not paper_only,
                     )
-                    self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, reason)
+                    self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, gate_detail or reason)
                 else:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, gate_detail or reason)
             else:
                 report.skipped += 1
                 self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
@@ -547,15 +692,24 @@ class TradingEngine:
             if price is None:
                 continue
             sent = self.aggregator.get_sentiment(pos.symbol)
+            tp_pct, sl_pct = self._atr_scaled_pcts(
+                pos.symbol, MARKET_STOCK, price,
+                self.tier.stock_tp_atr_mult, self.tier.stock_sl_atr_mult,
+                self.tier.stock_take_profit_pct, self.tier.stock_stop_loss_pct,
+            )
             decision = av.linear_exit_decision(
                 MARKET_STOCK, pos.symbol, pos.side,
                 pos.entry_price, price, sent.score,
-                take_profit_pct=self.tier.stock_take_profit_pct,
-                stop_loss_pct=self.tier.stock_stop_loss_pct,
+                take_profit_pct=tp_pct,
+                stop_loss_pct=sl_pct,
                 actionable=sent.actionable,
+                reversal_threshold=self.tier.entry_score_threshold,
             )
-            if decision.is_close:
-                if self._close_position(session, pos, price, decision.reason):
+            reason = decision.reason if decision.is_close else None
+            if reason is None and self._max_hold_exceeded(pos):
+                reason = f"max holding time exceeded ({self.config.max_hold_minutes}min)"
+            if reason:
+                if self._close_position(session, pos, price, reason):
                     report.closed += 1
                 else:
                     report.held += 1
@@ -583,14 +737,14 @@ class TradingEngine:
                 continue
             decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
             if decision.is_open:
-                ok, reason, paper_only = self._passes_entry_gates(
-                    session, MARKET_STOCK, ticker, sent.score,
+                ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                    session, MARKET_STOCK, ticker, sent,
                     self.tier.stock_take_profit_pct,
                     self.tier.stock_stop_loss_pct,
                 )
                 if not ok:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, gate_detail or reason)
                     continue
                 price = self.alpaca.get_stock_price(ticker)
                 if price:
@@ -598,10 +752,10 @@ class TradingEngine:
                         session, MARKET_STOCK, ticker, decision, price,
                         place_order=not paper_only,
                     )
-                    self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, reason)
+                    self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, gate_detail or reason)
                 else:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, gate_detail or reason)
             else:
                 report.skipped += 1
                 self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
@@ -697,13 +851,13 @@ class TradingEngine:
             # risk gates: cooldown, tier conviction, Groq, EV. For options the
             # EV projection uses the tier's premium profit target vs. the -35%
             # premium stop encoded in the options ladder.
-            ok, reason, paper_only = self._passes_entry_gates(
-                session, MARKET_OPTION, underlying, sent.score,
+            ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                session, MARKET_OPTION, underlying, sent,
                 self.tier.option_profit_target_pct, abs(opt.STOP_LOSS),
             )
             if not ok:
                 report.skipped += 1
-                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, reason)
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, gate_detail or reason)
                 continue
             n = opt.contracts_for_budget(choice.premium, self.tier.position_budget_usd)
             if n < 1:
@@ -715,7 +869,7 @@ class TradingEngine:
             )
             self._record_open_outcome(
                 session, report, status, err, MARKET_OPTION,
-                choice.contract.symbol, sent, reason,
+                choice.contract.symbol, sent, gate_detail or reason,
             )
 
     def run_options_cycle(self) -> CycleReport:
@@ -847,7 +1001,7 @@ class TradingEngine:
 
         if not place_order:
             notional = qty * price
-            fees = self.config.round_trip_fees(notional) / 2  # entry side only
+            fees = self.config.round_trip_fees(market, notional) / 2  # entry side only
             pos = Position(
                 market=market, symbol=symbol, side=decision.side, qty=qty,
                 leverage=1.0, entry_price=price, current_price=price,
@@ -883,7 +1037,7 @@ class TradingEngine:
         filled_qty = result.filled_qty
         filled_price = result.filled_price or price
         notional = filled_qty * filled_price
-        fees = self.config.round_trip_fees(notional) / 2
+        fees = self.config.round_trip_fees(market, notional) / 2
         pos = Position(
             market=market, symbol=symbol, side=decision.side, qty=filled_qty,
             leverage=1.0, entry_price=filled_price, current_price=filled_price,
@@ -908,7 +1062,7 @@ class TradingEngine:
 
         if is_simulated:
             pnl = av.position_pnl_pct(pos.side, pos.entry_price, price) * pos.entry_notional
-            exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
+            exit_fees = self.config.round_trip_fees(pos.market, pos.entry_notional) / 2
             pos.status = POSITION_CLOSED
             pos.current_price = price
             pos.realized_pnl = pnl - exit_fees - pos.entry_fees
@@ -939,7 +1093,7 @@ class TradingEngine:
         exit_price = result.filled_price or price
         exit_qty = result.filled_qty
         pnl = av.position_pnl_pct(pos.side, pos.entry_price, exit_price) * pos.entry_notional
-        exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
+        exit_fees = self.config.round_trip_fees(pos.market, pos.entry_notional) / 2
         pos.status = POSITION_CLOSED
         pos.current_price = exit_price
         pos.realized_pnl = pnl - exit_fees - pos.entry_fees
@@ -962,11 +1116,11 @@ class TradingEngine:
         """
         won = (realized_pnl or 0.0) > 0
         if won:
-            self.loss_tracker.record_win(market)
+            self.loss_tracker.record_win(market, session)
         else:
             self.loss_tracker.record_loss(market, session)
         if self.conf_gate.is_active(market, self.tier, session):
-            self.conf_gate.record_paper_trade(market, self.tier, won, session)
+            self.conf_gate.record_paper_trade(market, self.tier, realized_pnl, session)
 
     def _open_option_position(
         self, session, underlying, side, choice, contracts, score, place_order: bool = True

@@ -26,4 +26,5 @@ doctl compute reserved-ip create --region nyc3
 ```
 
 See [`python_space/sentiment/README.md`](python_space/sentiment/README.md) for
-the crypto sentiment stack.
+the sentiment stack shared by all three avenues (its source roster is
+currently crypto-only, which is why stocks/options are disabled by default).
