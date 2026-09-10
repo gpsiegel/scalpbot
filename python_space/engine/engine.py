@@ -285,51 +285,89 @@ class TradingEngine:
             self.alpaca = AlpacaClient(paper=not self.config.is_live(), lazy=True)
 
     # -- risk gates ---------------------------------------------------------
-    def _passes_entry_gates(self, session, market, symbol, score, tp, sl):
+    def _passes_entry_gates(self, session, market, symbol, sent, tp, sl):
         """Run the tier + cooldown + Groq + confidence-floor + EV gates.
 
-        Returns ``(ok, reason, paper_only)``:
+        Returns ``(ok, reason, paper_only, detail)``:
 
         * ``ok`` -- whether an entry may be taken at all;
         * ``reason`` -- human-readable skip/accept reason (for logs);
         * ``paper_only`` -- when True the position must be opened as a paper
           trade (no real order) because the confidence gate is still validating
-          this tier for ``market``.
+          this tier for ``market``;
+        * ``detail`` -- ``None`` unless Groq actually ran, in which case a dict
+          of its full verdict (action/confidence/win-prob/reasoning/etc.) for
+          ``SignalLog.detail``, so every Groq call -- pass or fail -- is
+          recorded for later calibration, not just the ones that block a trade.
         """
+        score = sent.score
         # 1) consecutive-loss circuit breaker
         if self.loss_tracker.is_cooling_down(market, session):
-            return False, "cooldown active after consecutive losses", False
+            return False, "cooldown active after consecutive losses", False, None
         # 2) tier conviction gate (stricter than the avenue's base threshold)
         if abs(score) < self.tier.entry_score_threshold:
             return (
                 False,
                 f"score {score:.3f} below tier gate {self.tier.entry_score_threshold:.2f}",
                 False,
+                None,
             )
-        # 3) + 4) Groq advisor confidence floor and EV projection gate. Both
-        # depend on the advisor's verdict, so they are only enforced when Groq is
-        # configured. With no GROQ_API_KEY the advisor is disabled and the engine
-        # falls back to sentiment-only entries (the pre-advisor behaviour).
+        # 3)-5) Groq advisor endorsement, confidence floor, and EV projection
+        # gate. All depend on the advisor's verdict, so they are only enforced
+        # when Groq is configured. With no GROQ_API_KEY the advisor is
+        # disabled and the engine falls back to sentiment-only entries (the
+        # pre-advisor behaviour).
+        detail = None
         if not self.groq.is_disabled:
-            advice = self.groq.validate_trade(market, symbol, score, self.tier)
-            # 3) Groq advisor confidence floor
+            extra_context = {
+                "sentiment_coverage": round(sent.coverage, 4),
+                "sentiment_sources": {
+                    name: round(sig.score, 4)
+                    for name, sig in sent.signals.items()
+                    if sig.available
+                },
+            }
+            advice = self.groq.validate_trade(
+                market, symbol, score, self.tier, extra_context=extra_context
+            )
+            detail = {
+                "groq_action": advice.action,
+                "groq_confidence": round(advice.confidence, 4),
+                "groq_win_prob": round(advice.projected_win_probability, 4),
+                "groq_reasoning": advice.reasoning,
+                "risk_tier_fit": advice.risk_tier_fit,
+                "signal_strength": advice.signal_strength,
+            }
+            # 3) the advisor must actively endorse entering. A "hold"/"skip"
+            # verdict -- including the neutral-hold every failure path
+            # returns -- must never open a position on its own.
+            if not advice.endorses_entry:
+                return (
+                    False,
+                    f"groq did not endorse entry (action={advice.action})",
+                    False,
+                    detail,
+                )
+            # 4) Groq advisor confidence floor
             if advice.confidence < self.tier.groq_confidence_min:
                 return (
                     False,
                     f"groq confidence {advice.confidence:.2f} < {self.tier.groq_confidence_min:.2f}",
                     False,
+                    detail,
                 )
-            # 4) expected-value projection gate (must clear fee drag)
+            # 5) expected-value projection gate (must clear fee drag)
             round_trip_fee = self.config.taker_fee_pct * 2
             if not ev_positive(tp, sl, advice.projected_win_probability, round_trip_fee):
                 return (
                     False,
                     f"negative EV (win_prob {advice.projected_win_probability:.2f}) after fees",
                     False,
+                    detail,
                 )
-        # 5) confidence gate -- paper-validate the tier before real orders
+        # 6) confidence gate -- paper-validate the tier before real orders
         paper_only = self.conf_gate.is_active(market, self.tier, session)
-        return True, "risk gates passed", paper_only
+        return True, "risk gates passed", paper_only, detail
 
     @property
     def mode(self) -> str:
@@ -383,13 +421,13 @@ class TradingEngine:
             )
         )
 
-    def _record_open_outcome(self, session, report, status, err, market, symbol, sent, reason):
+    def _record_open_outcome(self, session, report, status, err, market, symbol, sent, detail):
         """Translate an ``_open_position``/``_open_option_position`` result
-        (``"opened" | "skip" | "rejected"``, reason) into report counters and
-        a signal-log row, shared by all three cycles."""
+        (``"opened" | "skip" | "rejected"``, reason/detail) into report
+        counters and a signal-log row, shared by all three cycles."""
         if status == "opened":
             report.opened += 1
-            self._log_signal(session, market, symbol, sent.score, sent.label, True, reason)
+            self._log_signal(session, market, symbol, sent.score, sent.label, True, detail)
         elif status == "skip":
             report.skipped += 1
             self._log_signal(session, market, symbol, sent.score, sent.label, False, err)
@@ -497,14 +535,14 @@ class TradingEngine:
                 continue
             decision = av.crypto_entry_decision(symbol, sent.score)
             if decision.is_open:
-                ok, reason, paper_only = self._passes_entry_gates(
-                    session, MARKET_CRYPTO, symbol, sent.score,
+                ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                    session, MARKET_CRYPTO, symbol, sent,
                     self.tier.crypto_take_profit_pct,
                     self.tier.crypto_stop_loss_pct,
                 )
                 if not ok:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, gate_detail or reason)
                     continue
                 price = self.alpaca.get_crypto_price(symbol)
                 if price:
@@ -512,10 +550,10 @@ class TradingEngine:
                         session, MARKET_CRYPTO, symbol, decision, price,
                         place_order=not paper_only,
                     )
-                    self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, reason)
+                    self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, gate_detail or reason)
                 else:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, gate_detail or reason)
             else:
                 report.skipped += 1
                 self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
@@ -583,14 +621,14 @@ class TradingEngine:
                 continue
             decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
             if decision.is_open:
-                ok, reason, paper_only = self._passes_entry_gates(
-                    session, MARKET_STOCK, ticker, sent.score,
+                ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                    session, MARKET_STOCK, ticker, sent,
                     self.tier.stock_take_profit_pct,
                     self.tier.stock_stop_loss_pct,
                 )
                 if not ok:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, gate_detail or reason)
                     continue
                 price = self.alpaca.get_stock_price(ticker)
                 if price:
@@ -598,10 +636,10 @@ class TradingEngine:
                         session, MARKET_STOCK, ticker, decision, price,
                         place_order=not paper_only,
                     )
-                    self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, reason)
+                    self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, gate_detail or reason)
                 else:
                     report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, gate_detail or reason)
             else:
                 report.skipped += 1
                 self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
@@ -697,13 +735,13 @@ class TradingEngine:
             # risk gates: cooldown, tier conviction, Groq, EV. For options the
             # EV projection uses the tier's premium profit target vs. the -35%
             # premium stop encoded in the options ladder.
-            ok, reason, paper_only = self._passes_entry_gates(
-                session, MARKET_OPTION, underlying, sent.score,
+            ok, reason, paper_only, gate_detail = self._passes_entry_gates(
+                session, MARKET_OPTION, underlying, sent,
                 self.tier.option_profit_target_pct, abs(opt.STOP_LOSS),
             )
             if not ok:
                 report.skipped += 1
-                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, reason)
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, gate_detail or reason)
                 continue
             n = opt.contracts_for_budget(choice.premium, self.tier.position_budget_usd)
             if n < 1:
@@ -715,7 +753,7 @@ class TradingEngine:
             )
             self._record_open_outcome(
                 session, report, status, err, MARKET_OPTION,
-                choice.contract.symbol, sent, reason,
+                choice.contract.symbol, sent, gate_detail or reason,
             )
 
     def run_options_cycle(self) -> CycleReport:

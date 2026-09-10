@@ -95,7 +95,8 @@ def test_groq_advisor_disabled_returns_neutral_hold():
     assert isinstance(advice, GroqAdvice)
     assert advice.action == "skip"
     assert advice.confidence == 0.0
-    assert advice.projected_win_probability == 0.5   # coin-flip -> fails EV gate
+    assert advice.projected_win_probability == 0.5   # coin-flip; EV-positive on its own,
+    # but action="skip" (not "enter") is what keeps this from endorsing a trade
     assert advice.endorses_entry is False
 
 

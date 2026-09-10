@@ -16,9 +16,13 @@ keep running even if Groq is unconfigured, rate-limited, slow, returns garbage
 JSON, or is down entirely. Therefore *every* failure path -- missing API key,
 network error, timeout, non-200 status, unparseable body, missing fields --
 collapses to the same conservative, neutral result: ``action="skip"`` with
-``confidence=0.0`` and a ``projected_win_probability`` of 0.5 (a coin flip,
-which after fees fails the EV gate and blocks the trade). A missing advisor thus
-never *opens* a position; it only ever declines to endorse one.
+``confidence=0.0`` and a ``projected_win_probability`` of 0.5. Note that a 0.5
+win probability is *not* what blocks the trade -- it is EV-positive after fees
+for every risk tier (a coin flip on an asymmetric tp/sl still clears the ~0.5%
+round-trip drag). What actually blocks a neutral-hold from opening a position
+is ``action != "enter"`` (the engine requires an explicit endorsement) and,
+redundantly, ``confidence=0.0`` failing the tier's confidence floor. A missing
+advisor thus never *opens* a position; it only ever declines to endorse one.
 
 The ``GROQ_API_KEY`` lives in Doppler (it is a real secret). Everything else
 about the advisor -- model, thresholds -- is non-secret configuration.

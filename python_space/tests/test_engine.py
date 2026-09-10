@@ -21,6 +21,7 @@ from engine import avenues as av  # noqa: E402
 from engine import options as opt  # noqa: E402
 from engine.alpaca_client import OptionContract, OrderResult  # noqa: E402
 from engine.engine import MARKET_CRYPTO, MARKET_OPTION, MARKET_STOCK, TradingEngine  # noqa: E402
+from engine.groq_advisor import GroqAdvice  # noqa: E402
 from engine.models import (  # noqa: E402
     Base,
     Position,
@@ -47,6 +48,30 @@ class FakeAgg:
         return AggregatedSentiment(
             coin=coin.upper(), score=self.score, label="x",
             actionable=self.actionable, coverage=self.coverage,
+        )
+
+
+class FakeGroq:
+    """Fake GroqAdvisor: always "enabled" (is_disabled=False) and returns a
+    fixed verdict, so tests can exercise the entry-gate logic that consumes
+    the advisor's action/confidence/win-probability without any network."""
+
+    def __init__(self, action="enter", confidence=0.9, win_prob=0.9):
+        self.action = action
+        self.confidence = confidence
+        self.win_prob = win_prob
+        self.calls = []
+
+    @property
+    def is_disabled(self):
+        return False
+
+    def validate_trade(self, market, symbol, score, tier, extra_context=None):
+        self.calls.append(extra_context)
+        return GroqAdvice(
+            action=self.action, confidence=self.confidence,
+            projected_win_probability=self.win_prob,
+            reasoning="test verdict", risk_tier_fit="good", signal_strength="strong",
         )
 
 
@@ -560,6 +585,54 @@ def test_no_entry_when_sentiment_not_actionable(session_factory):
     logs = s.query(SignalLog).all()
     assert any("insufficient sentiment coverage" in (log.detail or "") for log in logs)
     s.close()
+
+
+# --------------------------------------------------------------------------
+# Groq advisor gating (backlog: action was previously ignored)
+# --------------------------------------------------------------------------
+def test_groq_non_enter_action_blocks_entry_despite_high_confidence(session_factory):
+    # Before this fix, only confidence/EV were checked -- a "hold" verdict
+    # with high confidence and a great win-prob would have opened a position.
+    groq = FakeGroq(action="hold", confidence=0.95, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    r = e.run_crypto_cycle()
+    assert r.opened == 0
+    assert len(groq.calls) > 0  # the advisor was actually consulted
+
+
+def test_groq_enter_action_allows_entry(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    r = e.run_crypto_cycle()
+    assert r.opened >= 1
+
+
+def test_groq_verdict_logged_for_calibration(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    s = session_factory()
+    logs = s.query(SignalLog).filter(SignalLog.acted == True).all()  # noqa: E712
+    assert any(
+        isinstance(log.detail, dict) and log.detail.get("groq_action") == "enter"
+        for log in logs
+    )
+    s.close()
+
+
+def test_groq_extra_context_includes_sentiment_coverage(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0),
+                      aggregator=FakeAgg(0.6, coverage=0.83), groq=groq)
+    e.run_crypto_cycle()
+    assert len(groq.calls) > 0
+    ctx = groq.calls[0]
+    assert ctx is not None
+    assert ctx["sentiment_coverage"] == pytest.approx(0.83)
 
 
 def test_reconcile_skips_simulated_position(session_factory):
