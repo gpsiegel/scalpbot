@@ -262,3 +262,20 @@ def test_get_atr_never_raises_on_broker_error():
     client = _client(FakeTradingClient())
     client._stock_data = RaisingStockData()
     assert client.get_atr("PLTR", "stock", period=14) is None
+
+
+def test_get_recent_return_computes_pct_change():
+    # 6 bars (days=5 needs days+1=6): closes flat at 100 except the most
+    # recent bar closes at 103 -> +3% from 5 bars ago.
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(5)]
+    bars.append(FakeBar(high=104.0, low=102.0, close=103.0))
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_recent_return("PLTR", "stock", days=5) == pytest.approx(0.03)
+
+
+def test_get_recent_return_none_on_insufficient_history():
+    bars = [FakeBar(high=101.0, low=99.0, close=100.0) for _ in range(3)]
+    client = _client(FakeTradingClient())
+    client._stock_data = FakeStockDataClient({"PLTR": bars})
+    assert client.get_recent_return("PLTR", "stock", days=5) is None

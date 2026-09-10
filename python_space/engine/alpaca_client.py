@@ -177,19 +177,17 @@ class AlpacaClient:
             logger.warning("get_stock_price(%s) failed: %s", symbol, exc)
             return None
 
-    def get_atr(self, symbol: str, market: str, period: int = 14) -> Optional[float]:
-        """Average True Range for ``symbol`` (an absolute price, not a
-        percentage) from recent daily bars. ``market`` is ``"crypto"`` or
-        ``"stock"``. ``None`` on any error or insufficient history -- callers
-        must fall back to a static percentage. Never raises."""
+    def _get_daily_bars(self, symbol: str, market: str, lookback_days: int) -> List[Tuple[float, float, float]]:
+        """Recent daily ``(high, low, close)`` bars, oldest first. ``[]`` on
+        any error -- callers must handle that as "no data available"."""
         self._ensure()
         try:
             import datetime as _dt
 
             from alpaca.data.timeframe import TimeFrame
 
-            # A little slack beyond period+1 calendar days for weekends/holidays.
-            start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=(period + 5) * 2)
+            # A little slack for weekends/holidays.
+            start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=lookback_days * 2)
 
             if market == "crypto":
                 from alpaca.data.requests import CryptoBarsRequest
@@ -203,11 +201,31 @@ class AlpacaClient:
                 resp = self._stock_data.get_stock_bars(req)
 
             raw_bars = resp.data.get(symbol, []) if hasattr(resp, "data") else []
-            bars = [(float(b.high), float(b.low), float(b.close)) for b in raw_bars]
-            return compute_atr(bars, period=period)
+            return [(float(b.high), float(b.low), float(b.close)) for b in raw_bars]
         except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("get_atr(%s) failed: %s", symbol, exc)
+            logger.warning("_get_daily_bars(%s) failed: %s", symbol, exc)
+            return []
+
+    def get_atr(self, symbol: str, market: str, period: int = 14) -> Optional[float]:
+        """Average True Range for ``symbol`` (an absolute price, not a
+        percentage) from recent daily bars. ``market`` is ``"crypto"`` or
+        ``"stock"``. ``None`` on any error or insufficient history -- callers
+        must fall back to a static percentage. Never raises."""
+        bars = self._get_daily_bars(symbol, market, lookback_days=period + 5)
+        return compute_atr(bars, period=period)
+
+    def get_recent_return(self, symbol: str, market: str, days: int = 5) -> Optional[float]:
+        """Fractional price change (e.g. ``0.03`` == +3%) from the close
+        ``days`` bars ago to the most recent close. ``None`` on any error or
+        insufficient history. Never raises."""
+        bars = self._get_daily_bars(symbol, market, lookback_days=days + 3)
+        if len(bars) < days + 1:
             return None
+        start_close = bars[-(days + 1)][2]
+        end_close = bars[-1][2]
+        if not start_close:
+            return None
+        return (end_close - start_close) / start_close
 
     # -- options chain ------------------------------------------------------
     def list_option_contracts(

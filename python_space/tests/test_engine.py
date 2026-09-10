@@ -93,6 +93,7 @@ class FakeAlpaca:
         self.held_qty: dict = {}
         self.option_quotes: dict = {}  # symbol -> (bid, ask), absent == no quote
         self.atr_by_symbol: dict = {}  # symbol -> ATR, absent == no bar data (fallback to static pct)
+        self.recent_return_by_symbol: dict = {}  # symbol -> fractional return, absent == no bar data
         self.crypto_fee_pct = 0.0
         self._reject_next = False
         self._reject_error = "simulated rejection"
@@ -177,6 +178,9 @@ class FakeAlpaca:
 
     def get_atr(self, symbol, market, period=14):
         return self.atr_by_symbol.get(symbol)
+
+    def get_recent_return(self, symbol, market, days=5):
+        return self.recent_return_by_symbol.get(symbol)
 
 
 @pytest.fixture()
@@ -761,6 +765,29 @@ def test_groq_extra_context_includes_sentiment_coverage(session_factory):
     ctx = groq.calls[0]
     assert ctx is not None
     assert ctx["sentiment_coverage"] == pytest.approx(0.83)
+
+
+def test_groq_extra_context_includes_recent_return_and_atr_when_available(session_factory):
+    fake = FakeAlpaca(price=150.0)
+    fake.recent_return_by_symbol["SOL/USD"] = 0.045
+    fake.atr_by_symbol["SOL/USD"] = 3.2
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    ctx = groq.calls[0]
+    assert ctx["recent_return_5d_pct"] == pytest.approx(0.045)
+    assert ctx["atr"] == pytest.approx(3.2)
+
+
+def test_groq_extra_context_omits_recent_return_and_atr_when_unavailable(session_factory):
+    groq = FakeGroq(action="enter", confidence=0.9, win_prob=0.9)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6), groq=groq)
+    e.run_crypto_cycle()
+    ctx = groq.calls[0]
+    assert "recent_return_5d_pct" not in ctx
+    assert "atr" not in ctx
 
 
 def test_reconcile_skips_simulated_position(session_factory):

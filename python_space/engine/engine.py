@@ -386,6 +386,17 @@ class TradingEngine:
                     if sig.available
                 },
             }
+            # Real momentum/volatility features, not just the sentiment
+            # score -- both best-effort (None when bar data isn't available,
+            # e.g. a brand-new listing) and simply omitted rather than sent
+            # as a placeholder. For options, `symbol` here is the underlying
+            # stock ticker, so these still resolve correctly.
+            recent_return = self.alpaca.get_recent_return(symbol, market)
+            if recent_return is not None:
+                extra_context["recent_return_5d_pct"] = round(recent_return, 4)
+            atr = self.alpaca.get_atr(symbol, market)
+            if atr is not None:
+                extra_context["atr"] = round(atr, 4)
             advice = self.groq.validate_trade(
                 market, symbol, score, self.tier, extra_context=extra_context
             )
