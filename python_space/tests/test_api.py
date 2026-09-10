@@ -18,6 +18,7 @@ os.environ.setdefault("STOCK_TICKERS", "PLTR")
 os.environ.setdefault("CRYPTO_CORE_COINS", "SOL")
 
 from config import Config  # noqa: E402
+from engine.alpaca_client import OrderResult  # noqa: E402
 from engine.api import create_app  # noqa: E402
 from engine.engine import TradingEngine  # noqa: E402
 from engine.models import Base, make_engine  # noqa: E402
@@ -43,13 +44,22 @@ class FakeAlpaca:
         return []
 
     def submit_crypto_order(self, *a, **k):
-        return None
+        return OrderResult(ok=True, order_id="fake-1", filled_qty=1.0, filled_price=100.0, status="filled")
 
     def submit_stock_order(self, *a, **k):
-        return None
+        return OrderResult(ok=True, order_id="fake-1", filled_qty=1.0, filled_price=20.0, status="filled")
 
     def submit_option_order(self, *a, **k):
+        return OrderResult(ok=True, order_id="fake-1", filled_qty=1.0, filled_price=0.55, status="filled")
+
+    def close_position(self, symbol):
+        return OrderResult(ok=True, order_id="fake-2", filled_qty=1.0, filled_price=100.0, status="filled")
+
+    def get_position_qty(self, symbol):
         return None
+
+    def list_positions(self):
+        return []
 
 
 @pytest.fixture()

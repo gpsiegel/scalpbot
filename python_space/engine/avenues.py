@@ -135,12 +135,18 @@ def linear_exit_decision(
     score: float,
     take_profit_pct: Optional[float] = None,
     stop_loss_pct: Optional[float] = None,
+    actionable: bool = True,
 ) -> AvenueDecision:
     """Exit logic shared by crypto and stock (price + sentiment reversal).
 
     ``take_profit_pct`` / ``stop_loss_pct`` let the engine pass the *active risk
     tier's* thresholds per call. When omitted they fall back to the module-level
     globals, preserving the original behaviour (and existing tests).
+
+    ``actionable`` (default True) gates the sentiment-reversal exit only:
+    price-based take-profit/stop-loss always apply, but when the aggregated
+    sentiment behind ``score`` doesn't have enough source coverage to trust
+    (see sentiment.aggregator), a reversal is never inferred from it.
     """
     tp = TAKE_PROFIT_PCT if take_profit_pct is None else take_profit_pct
     sl = STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
@@ -156,17 +162,18 @@ def linear_exit_decision(
             action="close", market=market, symbol=symbol, side=side, score=score,
             reason=f"stop loss {pnl*100:.2f}% <= {-sl*100:.2f}%",
         )
-    # sentiment reversal
-    if side == SIDE_LONG and score < SENTIMENT_FLIP - CRYPTO_ENTRY_SCORE:
-        return AvenueDecision(
-            action="close", market=market, symbol=symbol, side=side, score=score,
-            reason=f"sentiment reversed to {score:.3f}",
-        )
-    if side == SIDE_SHORT and score > SENTIMENT_FLIP + STOCK_ENTRY_SCORE:
-        return AvenueDecision(
-            action="close", market=market, symbol=symbol, side=side, score=score,
-            reason=f"sentiment reversed to {score:.3f}",
-        )
+    # sentiment reversal (only when the sentiment behind `score` is actionable)
+    if actionable:
+        if side == SIDE_LONG and score < SENTIMENT_FLIP - CRYPTO_ENTRY_SCORE:
+            return AvenueDecision(
+                action="close", market=market, symbol=symbol, side=side, score=score,
+                reason=f"sentiment reversed to {score:.3f}",
+            )
+        if side == SIDE_SHORT and score > SENTIMENT_FLIP + STOCK_ENTRY_SCORE:
+            return AvenueDecision(
+                action="close", market=market, symbol=symbol, side=side, score=score,
+                reason=f"sentiment reversed to {score:.3f}",
+            )
     return AvenueDecision(
         action="hold", market=market, symbol=symbol, side=side, score=score,
         reason=f"pnl {pnl*100:.2f}% within band",

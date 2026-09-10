@@ -87,7 +87,11 @@ def test_real_nonprod_file_loads_defaults(monkeypatch):
     monkeypatch.setenv("APP_ENV", "nonprod")
     c = Config.from_env()
     assert c.app_env == "nonprod"
-    assert c.avenues.crypto and c.avenues.stocks and c.avenues.options
+    # Stocks/options are off by default (no equity-capable sentiment source
+    # yet -- see sentiment.base.EQUITY_CAPABLE_SOURCES); crypto stays on.
+    assert c.avenues.crypto is True
+    assert c.avenues.stocks is False
+    assert c.avenues.options is False
     assert c.risk_tier == "moderate"
 
 
