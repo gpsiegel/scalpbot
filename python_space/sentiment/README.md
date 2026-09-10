@@ -1,7 +1,15 @@
 # scalpbot Sentiment Stack
 
-Aggregates crypto sentiment for the tradeable coins (**SOL/USD**, **DOGE/USD**)
-into a single normalized score in `[-1, 1]` per coin.
+`SentimentAggregator` is shared by all three avenues -- crypto, stocks, and
+options all call `get_sentiment(symbol)` and get back a single normalized
+score in `[-1, 1]`. What's crypto-only today is the **source roster**, not
+the aggregator itself: every source below but Fear & Greed only resolves a
+symbol through `sentiment.base.COIN_METADATA` (crypto tickers), so a stock
+ticker like `PLTR` currently has just one source (a market-wide crypto
+index) to draw on. The `coverage`/`actionable` gate below exists precisely
+to catch that case, and it's why `ENABLE_STOCKS`/`ENABLE_OPTIONS` are off in
+`environments/*.env` until an equity-capable source is added (see
+`sentiment.base.EQUITY_CAPABLE_SOURCES`, empty today).
 
 ## Sources & weights
 
