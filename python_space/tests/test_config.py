@@ -41,6 +41,12 @@ def test_defaults():
     assert c.caps.total == 3
     assert c.options.min_dte == 7
     assert c.costs.crypto_taker_fee_pct == 0.0025
+    assert c.max_hold_minutes == 240
+
+
+def test_max_hold_minutes_env_override(monkeypatch):
+    monkeypatch.setenv("MAX_HOLD_MINUTES", "30")
+    assert Config.from_env().max_hold_minutes == 30
 
 
 def test_list_parsing_upper_and_dedup(monkeypatch):

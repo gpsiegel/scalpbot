@@ -77,13 +77,27 @@ class TierParams:
 
     name: str
 
-    # crypto exit thresholds (fractions of entry price)
+    # crypto exit thresholds (fractions of entry price). Used as the static
+    # fallback when ATR data is unavailable, and for crypto_breakeven_wr's
+    # nominal estimate; the live exit distance is ATR-scaled -- see the
+    # *_atr_mult fields below.
     crypto_take_profit_pct: float
     crypto_stop_loss_pct: float
 
-    # stock exit thresholds (fractions of entry price)
+    # stock exit thresholds (fractions of entry price) -- same role as above.
     stock_take_profit_pct: float
     stock_stop_loss_pct: float
+
+    # ATR multiples for volatility-scaled exits (engine._manage_crypto_exits /
+    # _manage_stock_exits): tp_pct = (ATR * tp_mult) / price, so the same
+    # tier stakes a wider/tighter distance depending on how volatile the
+    # asset actually is right now, rather than a fixed percentage. Chosen to
+    # preserve each tier's reward:risk ratio above (e.g. moderate crypto's
+    # 2:1 is 3.0/1.5 here too); only the absolute scale is now ATR-driven.
+    crypto_tp_atr_mult: float
+    crypto_sl_atr_mult: float
+    stock_tp_atr_mult: float
+    stock_sl_atr_mult: float
 
     # option management: which rung of the +20/40/60% premium ladder to target
     option_profit_target_pct: float
@@ -119,6 +133,10 @@ _TIERS: dict[str, TierParams] = {
         crypto_stop_loss_pct=0.02,
         stock_take_profit_pct=0.03,    # 2:1 R:R; break-even ~44.4%
         stock_stop_loss_pct=0.015,
+        crypto_tp_atr_mult=2.0,        # 2:1 R:R, tightest ATR distance
+        crypto_sl_atr_mult=1.0,
+        stock_tp_atr_mult=2.0,
+        stock_sl_atr_mult=1.0,
         option_profit_target_pct=0.20,  # +20% premium (ladder rung 1)
         entry_score_threshold=0.25,     # tighter conviction gate
         groq_confidence_min=0.60,       # Groq must be >= 60% confident
@@ -130,6 +148,10 @@ _TIERS: dict[str, TierParams] = {
         crypto_stop_loss_pct=0.03,
         stock_take_profit_pct=0.04,    # 2:1 R:R; break-even ~41.7%
         stock_stop_loss_pct=0.02,
+        crypto_tp_atr_mult=3.0,        # 2:1 R:R, standard ATR distance
+        crypto_sl_atr_mult=1.5,
+        stock_tp_atr_mult=3.0,
+        stock_sl_atr_mult=1.5,
         option_profit_target_pct=0.40,  # +40% premium (ladder rung 2)
         entry_score_threshold=0.20,
         groq_confidence_min=0.55,
@@ -141,6 +163,10 @@ _TIERS: dict[str, TierParams] = {
         crypto_stop_loss_pct=0.04,
         stock_take_profit_pct=0.06,    # 2.4:1 R:R; break-even ~35.3%
         stock_stop_loss_pct=0.025,
+        crypto_tp_atr_mult=4.5,        # 2.25:1 R:R, widest ATR distance
+        crypto_sl_atr_mult=2.0,
+        stock_tp_atr_mult=4.8,         # 2.4:1 R:R
+        stock_sl_atr_mult=2.0,
         option_profit_target_pct=0.60,  # +60% premium (ladder rung 3)
         entry_score_threshold=0.30,     # higher conviction required
         groq_confidence_min=0.60,       # high confidence needed for larger bets

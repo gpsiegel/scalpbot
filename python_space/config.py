@@ -270,6 +270,11 @@ class Config:
     # Alpaca auto-exercises/force-sells ITM contracts near expiry.
     option_exit_dte: int = 2  # OPTION_EXIT_DTE
 
+    # crypto/stock management: close a position after this many minutes
+    # regardless of P&L, independent of the ATR-scaled take-profit/stop-loss.
+    # 0 disables the check.
+    max_hold_minutes: int = 240  # MAX_HOLD_MINUTES
+
     # instrument universe (from Doppler)
     stock_tickers: List[str] = field(default_factory=list)
     crypto_core_coins: List[str] = field(default_factory=list)
@@ -338,6 +343,7 @@ class Config:
             weights=SentimentWeights.from_env(),
             costs=MarketCosts.from_env(),
             option_exit_dte=_get_int("OPTION_EXIT_DTE", 2),
+            max_hold_minutes=_get_int("MAX_HOLD_MINUTES", 240),
             stock_tickers=_get_list("STOCK_TICKERS", []),
             crypto_core_coins=_get_list("CRYPTO_CORE_COINS", []),
             crypto_satellite_coins=_get_list("CRYPTO_SATELLITE_COINS", []),

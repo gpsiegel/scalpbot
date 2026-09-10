@@ -547,6 +547,34 @@ class TradingEngine:
         return warnings
 
     # -- crypto -------------------------------------------------------------
+    def _atr_scaled_pcts(
+        self, symbol: str, market: str, price: float,
+        tp_mult: float, sl_mult: float,
+        fallback_tp: float, fallback_sl: float,
+    ) -> Tuple[float, float]:
+        """ATR-scaled take-profit/stop-loss as fractions of ``price``.
+
+        Falls back to the tier's static percentages when there isn't enough
+        bar history yet (new listing, data feed hiccup, etc.) -- volatility
+        scaling is strictly an improvement over the fixed percentage, never
+        a hard dependency the engine can't run without.
+        """
+        if not price:
+            return fallback_tp, fallback_sl
+        atr = self.alpaca.get_atr(symbol, market)
+        if not atr:
+            return fallback_tp, fallback_sl
+        return (atr * tp_mult) / price, (atr * sl_mult) / price
+
+    def _max_hold_exceeded(self, pos: Position) -> bool:
+        if not self.config.max_hold_minutes or not pos.opened_at:
+            return False
+        opened_at = pos.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
+        elapsed_minutes = (_utcnow() - opened_at).total_seconds() / 60.0
+        return elapsed_minutes >= self.config.max_hold_minutes
+
     def _manage_crypto_exits(self, session, report: CycleReport) -> None:
         for pos in self._open_positions(session, MARKET_CRYPTO):
             coin = pos.symbol.split("/")[0]
@@ -554,16 +582,24 @@ class TradingEngine:
             if price is None:
                 continue
             sent = self.aggregator.get_sentiment(coin)
+            tp_pct, sl_pct = self._atr_scaled_pcts(
+                pos.symbol, MARKET_CRYPTO, price,
+                self.tier.crypto_tp_atr_mult, self.tier.crypto_sl_atr_mult,
+                self.tier.crypto_take_profit_pct, self.tier.crypto_stop_loss_pct,
+            )
             decision = av.linear_exit_decision(
                 MARKET_CRYPTO, pos.symbol, pos.side,
                 pos.entry_price, price, sent.score,
-                take_profit_pct=self.tier.crypto_take_profit_pct,
-                stop_loss_pct=self.tier.crypto_stop_loss_pct,
+                take_profit_pct=tp_pct,
+                stop_loss_pct=sl_pct,
                 actionable=sent.actionable,
                 reversal_threshold=self.tier.entry_score_threshold,
             )
-            if decision.is_close:
-                if self._close_position(session, pos, price, decision.reason):
+            reason = decision.reason if decision.is_close else None
+            if reason is None and self._max_hold_exceeded(pos):
+                reason = f"max holding time exceeded ({self.config.max_hold_minutes}min)"
+            if reason:
+                if self._close_position(session, pos, price, reason):
                     report.closed += 1
                 else:
                     report.held += 1
@@ -645,16 +681,24 @@ class TradingEngine:
             if price is None:
                 continue
             sent = self.aggregator.get_sentiment(pos.symbol)
+            tp_pct, sl_pct = self._atr_scaled_pcts(
+                pos.symbol, MARKET_STOCK, price,
+                self.tier.stock_tp_atr_mult, self.tier.stock_sl_atr_mult,
+                self.tier.stock_take_profit_pct, self.tier.stock_stop_loss_pct,
+            )
             decision = av.linear_exit_decision(
                 MARKET_STOCK, pos.symbol, pos.side,
                 pos.entry_price, price, sent.score,
-                take_profit_pct=self.tier.stock_take_profit_pct,
-                stop_loss_pct=self.tier.stock_stop_loss_pct,
+                take_profit_pct=tp_pct,
+                stop_loss_pct=sl_pct,
                 actionable=sent.actionable,
                 reversal_threshold=self.tier.entry_score_threshold,
             )
-            if decision.is_close:
-                if self._close_position(session, pos, price, decision.reason):
+            reason = decision.reason if decision.is_close else None
+            if reason is None and self._max_hold_exceeded(pos):
+                reason = f"max holding time exceeded ({self.config.max_hold_minutes}min)"
+            if reason:
+                if self._close_position(session, pos, price, reason):
                     report.closed += 1
                 else:
                     report.held += 1

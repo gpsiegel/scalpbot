@@ -26,6 +26,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+from .volatility import compute_atr
+
 logger = logging.getLogger("scalpbot.engine.alpaca")
 
 # Order statuses that mean "the broker is done deciding" -- stop polling.
@@ -173,6 +175,38 @@ class AlpacaClient:
             return float(resp[symbol].price)
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("get_stock_price(%s) failed: %s", symbol, exc)
+            return None
+
+    def get_atr(self, symbol: str, market: str, period: int = 14) -> Optional[float]:
+        """Average True Range for ``symbol`` (an absolute price, not a
+        percentage) from recent daily bars. ``market`` is ``"crypto"`` or
+        ``"stock"``. ``None`` on any error or insufficient history -- callers
+        must fall back to a static percentage. Never raises."""
+        self._ensure()
+        try:
+            import datetime as _dt
+
+            from alpaca.data.timeframe import TimeFrame
+
+            # A little slack beyond period+1 calendar days for weekends/holidays.
+            start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=(period + 5) * 2)
+
+            if market == "crypto":
+                from alpaca.data.requests import CryptoBarsRequest
+
+                req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start)
+                resp = self._crypto_data.get_crypto_bars(req)
+            else:
+                from alpaca.data.requests import StockBarsRequest
+
+                req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start)
+                resp = self._stock_data.get_stock_bars(req)
+
+            raw_bars = resp.data.get(symbol, []) if hasattr(resp, "data") else []
+            bars = [(float(b.high), float(b.low), float(b.close)) for b in raw_bars]
+            return compute_atr(bars, period=period)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("get_atr(%s) failed: %s", symbol, exc)
             return None
 
     # -- options chain ------------------------------------------------------

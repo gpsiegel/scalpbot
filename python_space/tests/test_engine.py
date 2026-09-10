@@ -92,6 +92,7 @@ class FakeAlpaca:
         self.close_calls = 0
         self.held_qty: dict = {}
         self.option_quotes: dict = {}  # symbol -> (bid, ask), absent == no quote
+        self.atr_by_symbol: dict = {}  # symbol -> ATR, absent == no bar data (fallback to static pct)
         self.crypto_fee_pct = 0.0
         self._reject_next = False
         self._reject_error = "simulated rejection"
@@ -173,6 +174,9 @@ class FakeAlpaca:
 
     def list_positions(self):
         return []
+
+    def get_atr(self, symbol, market, period=14):
+        return self.atr_by_symbol.get(symbol)
 
 
 @pytest.fixture()
@@ -335,6 +339,87 @@ def test_manage_exits_alone_closes_on_take_profit(session_factory):
     r = e.manage_exits(MARKET_CRYPTO)
     assert r.closed >= 1
     assert _count_open(session_factory) == 0
+
+
+def test_atr_scaled_exit_uses_atr_not_static_pct(session_factory):
+    # moderate tier: crypto_take_profit_pct=0.06 (static fallback),
+    # crypto_tp_atr_mult=3.0. With no ATR data, a 5% move must NOT close...
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True},
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+
+    fake.price = 150.0 * 1.05
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 0
+
+    # ...but with ATR=1.0, tp distance = (1.0*3.0)/150.0 ~= 2% -- the same 5%
+    # move now clears the ATR-scaled target easily.
+    fake.atr_by_symbol["SOL/USD"] = 1.0
+    r2 = e.manage_exits(MARKET_CRYPTO)
+    assert r2.closed == 1
+
+
+def test_max_hold_time_exit_fires_regardless_of_pnl(session_factory):
+    import datetime as _dt
+
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(max_hold_minutes=60), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    stale_time = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=120)
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True}, opened_at=stale_time,
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+
+    # price unchanged (well within any tp/sl band) -- only the holding-time
+    # exit should fire.
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 1
+    s2 = session_factory()
+    trade = (
+        s2.query(Trade)
+        .filter(Trade.symbol == "SOL/USD", Trade.action == "close")
+        .first()
+    )
+    assert "max holding time" in trade.reason
+    s2.close()
+
+
+def test_max_hold_time_disabled_when_zero(session_factory):
+    import datetime as _dt
+
+    fake = FakeAlpaca(price=150.0)
+    e = TradingEngine(config=_cfg(max_hold_minutes=0), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    ancient = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)
+    pos = Position(
+        market=MARKET_CRYPTO, symbol="SOL/USD", side="long", qty=1.0,
+        leverage=1.0, entry_price=150.0, current_price=150.0,
+        entry_notional=150.0, entry_fees=0.0, status=POSITION_OPEN,
+        extra={"simulated": True}, opened_at=ancient,
+    )
+    s.add(pos)
+    s.commit()
+    s.close()
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed == 0
 
 
 def test_total_cap_enforced(session_factory):
