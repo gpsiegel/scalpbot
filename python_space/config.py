@@ -169,17 +169,19 @@ class OptionsFilters:
     (long calls / puts)."""
 
     min_dte: int = 7          # skip near-expiry / 0-DTE contracts
+    max_dte: int = 45         # bound the contract query on the far side too
     max_otm_pct: float = 0.10  # only near-the-money, no deep-OTM lottery tickets
     min_premium: float = 0.10  # skip near-worthless contracts
-    max_spread_pct: float = 0.25  # skip illiquid, wide bid/ask contracts
+    max_spread_pct: float = 0.08  # skip illiquid, wide bid/ask contracts
 
     @classmethod
     def from_env(cls) -> "OptionsFilters":
         return cls(
             min_dte=_get_int("OPTION_MIN_DTE", 7),
+            max_dte=_get_int("OPTION_MAX_DTE", 45),
             max_otm_pct=_get_float("OPTION_MAX_OTM_PCT", 0.10),
             min_premium=_get_float("OPTION_MIN_PREMIUM", 0.10),
-            max_spread_pct=_get_float("OPTION_MAX_SPREAD_PCT", 0.25),
+            max_spread_pct=_get_float("OPTION_MAX_SPREAD_PCT", 0.08),
         )
 
 
@@ -222,6 +224,11 @@ class Config:
     caps: PositionCaps = field(default_factory=PositionCaps)
     options: OptionsFilters = field(default_factory=OptionsFilters)
     weights: SentimentWeights = field(default_factory=SentimentWeights)
+
+    # options management (not an entry filter, so it lives outside OptionsFilters):
+    # close a held option once it is this close to expiry, regardless of P&L --
+    # Alpaca auto-exercises/force-sells ITM contracts near expiry.
+    option_exit_dte: int = 2  # OPTION_EXIT_DTE
 
     # instrument universe (from Doppler)
     stock_tickers: List[str] = field(default_factory=list)
@@ -291,6 +298,7 @@ class Config:
             caps=PositionCaps.from_env(),
             options=OptionsFilters.from_env(),
             weights=SentimentWeights.from_env(),
+            option_exit_dte=_get_int("OPTION_EXIT_DTE", 2),
             stock_tickers=_get_list("STOCK_TICKERS", []),
             crypto_core_coins=_get_list("CRYPTO_CORE_COINS", []),
             crypto_satellite_coins=_get_list("CRYPTO_SATELLITE_COINS", []),

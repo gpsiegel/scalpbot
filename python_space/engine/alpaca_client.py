@@ -24,7 +24,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger("scalpbot.engine.alpaca")
 
@@ -180,25 +180,46 @@ class AlpacaClient:
         self,
         underlying: str,
         option_type: str,
-        expiration_gte: Optional[str] = None,
-        expiration_lte: Optional[str] = None,
+        spot: float,
+        filters: Any,
         limit: int = 100,
     ) -> List[OptionContract]:
         """Fetch tradable option contracts for an underlying, then enrich with a
-        latest quote (bid/ask) so the caller can apply spread/premium filters."""
+        latest quote (bid/ask) so the caller can apply spread/premium filters.
+
+        Bounds the query itself rather than relying on Alpaca's default window
+        (which only returns contracts expiring before the upcoming weekend):
+        expiration between ``filters.min_dte``/``max_dte`` days out, and
+        strike within ``filters.max_otm_pct`` of ``spot`` (widened by a fixed
+        5 points so contracts right at the boundary aren't excluded before
+        ``engine.options.passes_filters`` runs its own precise check).
+        """
         self._ensure()
         contracts: List[OptionContract] = []
         try:
+            import datetime as _dt
+
             from alpaca.trading.requests import GetOptionContractsRequest
             from alpaca.trading.enums import ContractType, AssetStatus
+
+            today = _dt.date.today()
+            exp_gte = today + _dt.timedelta(days=filters.min_dte)
+            exp_lte = today + _dt.timedelta(days=filters.max_dte)
+
+            pad = filters.max_otm_pct + 0.05
+            strike_lo = max(0.01, spot * (1 - pad))
+            strike_hi = spot * (1 + pad)
 
             ctype = ContractType.CALL if option_type == "call" else ContractType.PUT
             req = GetOptionContractsRequest(
                 underlying_symbols=[underlying],
                 status=AssetStatus.ACTIVE,
                 type=ctype,
-                expiration_date_gte=expiration_gte,
-                expiration_date_lte=expiration_lte,
+                expiration_date_gte=exp_gte,
+                expiration_date_lte=exp_lte,
+                # alpaca-py types these as str, not float.
+                strike_price_gte=f"{strike_lo:.2f}",
+                strike_price_lte=f"{strike_hi:.2f}",
                 limit=limit,
             )
             resp = self._trading.get_option_contracts(req)
@@ -237,6 +258,33 @@ class AlpacaClient:
                     c.ask = float(getattr(q, "ask_price", 0.0) or 0.0)
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("option quote enrich failed: %s", exc)
+
+    def get_option_quote(self, symbol: str) -> Optional[Tuple[float, float]]:
+        """Latest ``(bid, ask)`` for a single OCC option symbol.
+
+        ``None`` if there is no option data client, no quote, or the call
+        fails -- the management loop holds the position rather than acting on
+        a stale/missing price. Never raises.
+        """
+        self._ensure()
+        if self._option_data is None:
+            return None
+        try:
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+            resp = self._option_data.get_option_latest_quote(req)
+            q = resp.get(symbol) if hasattr(resp, "get") else resp[symbol]
+            if q is None:
+                return None
+            bid = float(getattr(q, "bid_price", 0.0) or 0.0)
+            ask = float(getattr(q, "ask_price", 0.0) or 0.0)
+            if bid <= 0 and ask <= 0:
+                return None
+            return bid, ask
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("get_option_quote(%s) failed: %s", symbol, exc)
+            return None
 
     # -- orders -------------------------------------------------------------
     def submit_crypto_order(self, symbol: str, side: str, qty: float) -> OrderResult:

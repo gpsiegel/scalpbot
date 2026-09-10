@@ -20,7 +20,7 @@ from config import Config, OptionsFilters  # noqa: E402
 from engine import avenues as av  # noqa: E402
 from engine import options as opt  # noqa: E402
 from engine.alpaca_client import OptionContract, OrderResult  # noqa: E402
-from engine.engine import MARKET_CRYPTO, MARKET_STOCK, TradingEngine  # noqa: E402
+from engine.engine import MARKET_CRYPTO, MARKET_OPTION, MARKET_STOCK, TradingEngine  # noqa: E402
 from engine.models import (  # noqa: E402
     Base,
     Position,
@@ -66,6 +66,7 @@ class FakeAlpaca:
         self.orders = []
         self.close_calls = 0
         self.held_qty: dict = {}
+        self.option_quotes: dict = {}  # symbol -> (bid, ask), absent == no quote
         self.crypto_fee_pct = 0.0
         self._reject_next = False
         self._reject_error = "simulated rejection"
@@ -88,15 +89,18 @@ class FakeAlpaca:
     def is_market_open(self):
         return True
 
-    def list_option_contracts(self, underlying, option_type, **kw):
+    def list_option_contracts(self, underlying, option_type, spot=None, filters=None, **kw):
         return [
             OptionContract(symbol=f"{underlying}_ATM", underlying=underlying,
                            option_type=option_type, strike=self.spot + 1,
-                           expiration="2099-01-17", bid=0.50, ask=0.55, open_interest=100),
+                           expiration="2099-01-17", bid=0.52, ask=0.55, open_interest=100),
             OptionContract(symbol=f"{underlying}_DEEP", underlying=underlying,
                            option_type=option_type, strike=self.spot + 10,
                            expiration="2099-01-17", bid=0.03, ask=0.05, open_interest=5),
         ]
+
+    def get_option_quote(self, symbol):
+        return self.option_quotes.get(symbol)
 
     def _fill(self, symbol, side, qty, price, market) -> OrderResult:
         if self._reject_next:
@@ -199,10 +203,12 @@ def test_position_pnl_direction():
 # --------------------------------------------------------------------------
 def test_options_filters_reject_deep_otm_and_low_premium():
     f = OptionsFilters()
+    # bid/ask kept under the 0.08 default spread cap -- this test is about
+    # OTM/premium rejection, not spread.
     good = OptionContract(symbol="G", underlying="P", option_type="call",
-                          strike=21, expiration="2099-01-17", bid=0.5, ask=0.55)
+                          strike=21, expiration="2099-01-17", bid=0.52, ask=0.55)
     deep = OptionContract(symbol="D", underlying="P", option_type="call",
-                          strike=40, expiration="2099-01-17", bid=0.5, ask=0.55)
+                          strike=40, expiration="2099-01-17", bid=0.52, ask=0.55)
     cheap = OptionContract(symbol="C", underlying="P", option_type="call",
                            strike=21, expiration="2099-01-17", bid=0.01, ask=0.02)
     assert opt.passes_filters(good, 20, f)
@@ -215,7 +221,7 @@ def test_options_reject_near_expiry():
     f = OptionsFilters()
     soon = (dt.date.today() + dt.timedelta(days=2)).isoformat()
     c = OptionContract(symbol="S", underlying="P", option_type="call",
-                       strike=21, expiration=soon, bid=0.5, ask=0.55)
+                       strike=21, expiration=soon, bid=0.52, ask=0.55)
     assert not opt.passes_filters(c, 20, f)
 
 
@@ -223,26 +229,38 @@ def test_options_select_prefers_atm():
     f = OptionsFilters()
     contracts = [
         OptionContract(symbol="ATM", underlying="P", option_type="call",
-                       strike=21, expiration="2099-01-17", bid=0.5, ask=0.55),
+                       strike=21, expiration="2099-01-17", bid=0.52, ask=0.55),
         OptionContract(symbol="OTM", underlying="P", option_type="call",
-                       strike=22, expiration="2099-01-17", bid=0.3, ask=0.35),
+                       strike=22, expiration="2099-01-17", bid=0.335, ask=0.35),
     ]
     choice = opt.select_contract(contracts, 20, "call", f)
     assert choice is not None and choice.contract.symbol == "ATM"
 
 
-def test_options_exit_ladder_and_pnl():
-    assert opt.exit_decision(1.0, 1.25) == "take_profit_20"
-    assert opt.exit_decision(1.0, 1.45) == "take_profit_40"
-    assert opt.exit_decision(1.0, 1.65) == "take_profit_60"
-    assert opt.exit_decision(1.0, 0.60) == "stop_loss"
-    assert opt.exit_decision(1.0, 1.05) is None
+def test_options_exit_single_target_and_pnl():
+    assert opt.exit_decision(1.0, 1.45, take_profit_pct=0.40) == "take_profit"
+    assert opt.exit_decision(1.0, 0.60, take_profit_pct=0.40) == "stop_loss"
+    assert opt.exit_decision(1.0, 1.05, take_profit_pct=0.40) is None
     assert opt.option_pnl(1.0, 1.5, 2) == pytest.approx(100.0)
+
+
+def test_options_exit_float_boundary():
+    # (0.70 - 0.50) / 0.50 computes as 0.3999999999999999 in float -- must
+    # still clear a 0.40 target rather than falling through to "hold".
+    assert opt.exit_decision(0.50, 0.70, take_profit_pct=0.40) == "take_profit"
 
 
 def test_contracts_for_budget():
     assert opt.contracts_for_budget(0.50, 100) == 2   # $50 each
     assert opt.contracts_for_budget(2.00, 100) == 0    # $200 each, unaffordable
+
+
+def test_default_spread_filter_rejects_wide_spread():
+    # OPTION_MAX_SPREAD_PCT default is 0.08; a 24% spread must be rejected.
+    f = OptionsFilters()
+    wide = OptionContract(symbol="W", underlying="P", option_type="call",
+                          strike=21, expiration="2099-01-17", bid=0.44, ask=0.56)
+    assert not opt.passes_filters(wide, 20, f)
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +315,85 @@ def test_options_cycle_opens_call_on_strong_bull(session_factory):
     pos = s.query(Position).filter(Position.market == "option").first()
     assert pos.option_type == "call" and pos.leverage >= 1
     s.close()
+
+
+def test_options_cycle_no_duplicate_underlying(session_factory):
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(spot=20.0), aggregator=FakeAgg(0.6))
+    e.run_options_cycle()
+    first_count = _count_open(session_factory)
+    assert first_count >= 1
+    e.run_options_cycle()  # still strongly bullish -- must not open a second contract
+    assert _count_open(session_factory) == first_count
+
+
+def _open_option(symbol="PLTR_ATM", underlying="PLTR", entry_price=0.55,
+                  expiration="2099-01-17"):
+    # Marked simulated so TradingEngine.reconcile() (which runs at the top of
+    # every cycle) doesn't treat this directly-inserted row as a real
+    # position missing at the broker and close it out from under the test.
+    return Position(
+        market=MARKET_OPTION, symbol=symbol, side="long", qty=1, leverage=1.0,
+        entry_price=entry_price, current_price=entry_price,
+        entry_notional=entry_price * 100, entry_fees=0.0,
+        underlying=underlying, strike=21.0, option_type="call",
+        expiration=expiration, sentiment_score=0.5, status=POSITION_OPEN,
+        extra={"simulated": True},
+    )
+
+
+def test_option_management_closes_on_bid_target(session_factory):
+    fake = FakeAlpaca()
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    pos = _open_option(entry_price=0.50)
+    s.add(pos)
+    s.commit()
+    s.close()
+    fake.option_quotes[pos.symbol] = (0.70, 0.72)  # bid up 40% -> take profit
+    r = e.run_options_cycle()
+    assert r.closed == 1
+    s2 = session_factory()
+    reloaded = s2.query(Position).filter(Position.symbol == pos.symbol).first()
+    assert reloaded.status == POSITION_CLOSED
+    s2.close()
+
+
+def test_option_management_holds_with_no_quote(session_factory):
+    fake = FakeAlpaca()
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    pos = _open_option()
+    s.add(pos)
+    s.commit()
+    s.close()
+    r = e.run_options_cycle()  # no quote set -> hold, no DTE due either
+    assert r.held >= 1
+    s2 = session_factory()
+    reloaded = s2.query(Position).filter(Position.symbol == pos.symbol).first()
+    assert reloaded.status == POSITION_OPEN
+    s2.close()
+
+
+def test_option_dte_exit_fires_without_quote(session_factory):
+    import datetime as _dt
+    fake = FakeAlpaca()
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=fake, aggregator=FakeAgg(0.0))
+    s = session_factory()
+    soon = (_dt.date.today() + _dt.timedelta(days=1)).isoformat()  # <= OPTION_EXIT_DTE (2)
+    pos = _open_option(expiration=soon)
+    s.add(pos)
+    s.commit()
+    s.close()
+    r = e.run_options_cycle()  # no quote available, but DTE exit must still fire
+    assert r.closed == 1
+    s2 = session_factory()
+    reloaded = s2.query(Position).filter(Position.symbol == pos.symbol).first()
+    assert reloaded.status == POSITION_CLOSED
+    s2.close()
 
 
 def test_mode_paper_by_default(session_factory):

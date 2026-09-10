@@ -5,15 +5,20 @@ Scope (intentionally narrow):
 * **Buy-to-open long only** -- bullish sentiment -> long CALL, bearish -> long
   PUT. No spreads, no selling premium, no assignment risk.
 * **Quality gates** (from :class:`config.OptionsFilters`):
-    - ``min_dte``        -- skip near-expiry / 0-DTE.
+    - ``min_dte`` / ``max_dte`` -- bound the contract query to a tradeable
+      expiry window.
     - ``max_otm_pct``    -- only near-the-money; no deep-OTM lottery tickets.
     - ``min_premium``    -- skip near-worthless contracts.
     - ``max_spread_pct`` -- skip illiquid, wide bid/ask contracts.
 * **P&L is premium-based**: a position stores contracts in ``leverage`` and the
-  entry premium (per share) in ``entry_price``. One contract = 100 shares.
+  entry premium (per share, at the ask -- the real cost basis) in
+  ``entry_price``. One contract = 100 shares.
 
-Early-management targets (long options): scale/close at **+20% / +40% / +60%**
-premium gains, hard stop at **-35%**.
+Management (long options): a single take-profit at the active risk tier's
+``option_profit_target_pct`` (matching what the EV gate assumed at entry),
+hard stop at **-35%**, plus a DTE-based expiry exit (``Config.option_exit_dte``)
+independent of P&L -- Alpaca auto-exercises/force-sells ITM contracts near
+expiry.
 """
 from __future__ import annotations
 
@@ -27,10 +32,13 @@ from .alpaca_client import OptionContract
 
 logger = logging.getLogger("scalpbot.engine.options")
 
-# Long-option management ladder.
-PROFIT_TARGETS = (0.20, 0.40, 0.60)
+# Long-option management: a single take-profit target (the active risk
+# tier's `option_profit_target_pct`) plus a hard stop.
 STOP_LOSS = -0.35
 CONTRACT_MULTIPLIER = 100  # shares per contract
+# Float-rounding tolerance for the take-profit/stop-loss boundary comparisons
+# (e.g. entry 0.50 -> current 0.70 computes as 0.3999999999999999, not 0.40).
+_EPSILON = 1e-9
 
 
 def days_to_expiration(expiration: str, today: Optional[dt.date] = None) -> int:
@@ -78,7 +86,9 @@ def passes_filters(
     if otm > filters.max_otm_pct:
         return False
 
-    premium = contract.mid
+    # A long option is bought near the ask, not the mid -- that's the real
+    # cost basis, so it's what the quality floor and sizing should use.
+    premium = contract.ask
     if premium < filters.min_premium:
         return False
 
@@ -110,7 +120,7 @@ def select_contract(
         candidates.append(
             ContractScore(
                 contract=c,
-                premium=c.mid,
+                premium=c.ask,
                 dte=days_to_expiration(c.expiration, today),
                 otm=otm_pct(spot, c.strike, c.option_type),
                 spread=c.spread_pct,
@@ -147,16 +157,22 @@ def pnl_pct(entry_premium: float, current_premium: float) -> float:
     return (current_premium - entry_premium) / entry_premium
 
 
-def exit_decision(entry_premium: float, current_premium: float) -> Optional[str]:
+def exit_decision(
+    entry_premium: float,
+    current_premium: float,
+    take_profit_pct: float,
+    stop_loss_pct: float = abs(STOP_LOSS),
+) -> Optional[str]:
     """Return a management action string, or None to hold.
 
-    * ``"stop_loss"``           when premium has fallen to the -35% stop.
-    * ``"take_profit_60"`` / ``_40`` / ``_20`` when a profit target is hit.
+    A single take-profit at ``take_profit_pct`` (the active risk tier's
+    ``option_profit_target_pct``, matching what the EV gate assumed at entry)
+    plus the ``stop_loss_pct`` hard stop. Compared with a small epsilon so
+    float rounding never misses an exact-boundary target.
     """
     pct = pnl_pct(entry_premium, current_premium)
-    if pct <= STOP_LOSS:
+    if pct <= -stop_loss_pct + _EPSILON:
         return "stop_loss"
-    for target in sorted(PROFIT_TARGETS, reverse=True):
-        if pct >= target:
-            return f"take_profit_{int(target * 100)}"
+    if pct >= take_profit_pct - _EPSILON:
+        return "take_profit"
     return None

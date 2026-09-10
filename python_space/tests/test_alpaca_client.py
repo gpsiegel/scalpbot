@@ -137,3 +137,64 @@ def test_close_position_never_raises_on_broker_error():
     result = client.close_position("SOL/USD")
     assert result.ok is False
     assert "no position" in result.error
+
+
+# --------------------------------------------------------------------------
+# PR 3: bounded options contract query + single-symbol quote
+# --------------------------------------------------------------------------
+class FakeContractsTradingClient:
+    def __init__(self):
+        self.last_request = None
+
+    def get_option_contracts(self, req):
+        self.last_request = req
+        return []
+
+
+def test_list_option_contracts_bounds_expiration_and_strike():
+    from config import OptionsFilters
+
+    trading = FakeContractsTradingClient()
+    client = _client(trading)
+    filters = OptionsFilters(min_dte=7, max_dte=45, max_otm_pct=0.10)
+
+    client.list_option_contracts("PLTR", "call", 20.0, filters)
+
+    req = trading.last_request
+    assert req is not None
+    # alpaca-py types these Optional[str] -- must be strings, not floats.
+    assert isinstance(req.strike_price_gte, str)
+    assert isinstance(req.strike_price_lte, str)
+    assert float(req.strike_price_gte) < 20.0 < float(req.strike_price_lte)
+    assert req.expiration_date_gte is not None
+    assert req.expiration_date_lte is not None
+    assert req.expiration_date_gte < req.expiration_date_lte
+
+
+@dataclass
+class FakeQuote:
+    bid_price: float
+    ask_price: float
+
+
+class FakeOptionDataClient:
+    def __init__(self, quotes=None):
+        self.quotes = quotes or {}
+
+    def get_option_latest_quote(self, req):
+        symbol = req.symbol_or_symbols
+        return {symbol: self.quotes[symbol]} if symbol in self.quotes else {}
+
+
+def test_get_option_quote_returns_bid_ask():
+    client = _client(FakeTradingClient())
+    client._option_data = FakeOptionDataClient(
+        quotes={"PLTR250117C00020000": FakeQuote(bid_price=0.50, ask_price=0.55)}
+    )
+    assert client.get_option_quote("PLTR250117C00020000") == (0.50, 0.55)
+
+
+def test_get_option_quote_none_when_missing():
+    client = _client(FakeTradingClient())
+    client._option_data = FakeOptionDataClient()
+    assert client.get_option_quote("NOPE") is None

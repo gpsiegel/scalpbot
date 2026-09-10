@@ -361,6 +361,20 @@ class TradingEngine:
             > 0
         )
 
+    def _has_open_option_for_underlying(self, session, underlying: str) -> bool:
+        """One contract per underlying at a time (a call and a put on the same
+        name would fight the sentiment signal that's supposed to pick one)."""
+        return (
+            session.query(Position)
+            .filter(
+                Position.market == MARKET_OPTION,
+                Position.underlying == underlying,
+                Position.status == POSITION_OPEN,
+            )
+            .count()
+            > 0
+        )
+
     def _log_signal(self, session, market, symbol, score, label, acted, detail=None):
         session.add(
             SignalLog(
@@ -625,12 +639,22 @@ class TradingEngine:
         try:
             report.errors.extend(self.reconcile(session, MARKET_OPTION))
 
-            # 1) manage open option positions via the premium ladder
+            # 1) manage open option positions: re-quote, premium target/stop,
+            # and a DTE-based expiry exit that fires independent of P&L.
             for pos in self._open_positions(session, MARKET_OPTION):
-                # For a real fill we'd re-quote pos.symbol; premium tracked in current_price.
-                current_premium = pos.current_price or pos.entry_price
-                action = opt.exit_decision(pos.entry_price, current_premium)
+                quote = self.alpaca.get_option_quote(pos.symbol)
+                action = None
+                if quote is not None:
+                    bid, _ask = quote
+                    pos.current_price = bid
+                    action = opt.exit_decision(
+                        pos.entry_price, bid, self.tier.option_profit_target_pct,
+                    )
+                dte = opt.days_to_expiration(pos.expiration) if pos.expiration else None
+                if dte is not None and dte <= self.config.option_exit_dte:
+                    action = "dte_exit"
                 if action:
+                    current_premium = pos.current_price or pos.entry_price
                     if self._close_option_position(session, pos, current_premium, action):
                         report.closed += 1
                     else:
@@ -659,13 +683,19 @@ class TradingEngine:
                     report.skipped += 1
                     self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
                     continue
+                if self._has_open_option_for_underlying(session, underlying):
+                    report.skipped += 1
+                    self._log_signal(
+                        session, MARKET_OPTION, underlying, sent.score, sent.label, False,
+                        f"already holding an option on {underlying}",
+                    )
+                    continue
                 spot = self.alpaca.get_stock_price(underlying)
                 if not spot:
                     report.skipped += 1
                     continue
                 contracts = self.alpaca.list_option_contracts(
-                    underlying, side,
-                    expiration_gte=None, expiration_lte=None,
+                    underlying, side, spot, self.config.options,
                 )
                 choice = opt.select_contract(contracts, spot, side, self.config.options)
                 if choice is None:
