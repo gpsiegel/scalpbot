@@ -482,6 +482,36 @@ def test_rejected_open_creates_no_position_and_rejected_trade(session_factory):
     s.close()
 
 
+def test_stock_entry_fee_is_spread_only_no_taker_fee(session_factory):
+    # Stocks are commission-free at Alpaca -- entry_fees must reflect only the
+    # modeled spread, never the crypto taker fee.
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(), aggregator=FakeAgg(0.5))
+    s = session_factory()
+    decision = _open_position(MARKET_STOCK, "F", score=0.5)
+    status, _err = e._open_position(s, MARKET_STOCK, "F", decision, 100.0, place_order=True)
+    assert status == "opened"
+    pos = s.query(Position).filter(Position.symbol == "F").first()
+    expected = pos.entry_notional * e.config.costs.stock_half_spread_pct
+    assert pos.entry_fees == pytest.approx(expected)
+    s.close()
+
+
+def test_crypto_entry_fee_is_taker_fee_plus_spread(session_factory):
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(), aggregator=FakeAgg(0.5))
+    s = session_factory()
+    decision = _open_position(MARKET_CRYPTO, "SOL/USD", score=0.5)
+    status, _err = e._open_position(s, MARKET_CRYPTO, "SOL/USD", decision, 100.0, place_order=True)
+    assert status == "opened"
+    pos = s.query(Position).filter(Position.symbol == "SOL/USD").first()
+    expected = pos.entry_notional * (
+        e.config.costs.crypto_taker_fee_pct + e.config.costs.crypto_half_spread_pct
+    )
+    assert pos.entry_fees == pytest.approx(expected)
+    s.close()
+
+
 def test_rejected_close_leaves_position_open(session_factory):
     fake = FakeAlpaca(price=100.0)
     e = TradingEngine(config=_cfg(), session_factory=session_factory,

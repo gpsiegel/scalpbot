@@ -207,6 +207,45 @@ class SentimentWeights:
 
 
 @dataclass
+class MarketCosts:
+    """Per-market round-trip execution cost model, fed into the EV gate and
+    realized P&L.
+
+    Alpaca charges a taker fee only on crypto; stocks are commission-free but
+    still cross a bid/ask spread on both legs of a round trip. Options are
+    handled differently: a long option is already bought near the ask and
+    sold near the bid (engine/options.py), so the spread cost is captured
+    structurally in the premium itself -- adding a separate spread charge on
+    top would double-count it. Only optional per-contract regulatory/exchange
+    fees are modeled for options, defaulted to 0.
+    """
+
+    crypto_taker_fee_pct: float = 0.0025    # 0.25% per side (Alpaca crypto taker fee)
+    crypto_half_spread_pct: float = 0.0005  # estimated per-side crypto spread
+    stock_half_spread_pct: float = 0.0005   # estimated per-side equity spread
+    option_regulatory_fee_pct: float = 0.0  # e.g. OCC/exchange fees, if modeled
+
+    @classmethod
+    def from_env(cls) -> "MarketCosts":
+        return cls(
+            crypto_taker_fee_pct=_get_float("CRYPTO_TAKER_FEE_PCT", 0.0025),
+            crypto_half_spread_pct=_get_float("CRYPTO_HALF_SPREAD_PCT", 0.0005),
+            stock_half_spread_pct=_get_float("STOCK_HALF_SPREAD_PCT", 0.0005),
+            option_regulatory_fee_pct=_get_float("OPTION_REGULATORY_FEE_PCT", 0.0),
+        )
+
+    def round_trip_pct(self, market: str) -> float:
+        """Total round-trip cost as a fraction of notional, for ``market``."""
+        if market == "crypto":
+            return 2 * (self.crypto_taker_fee_pct + self.crypto_half_spread_pct)
+        if market == "stock":
+            return 2 * self.stock_half_spread_pct
+        if market == "option":
+            return 2 * self.option_regulatory_fee_pct
+        return 0.0
+
+
+@dataclass
 class Config:
     """Top-level resolved configuration for a bot run."""
 
@@ -224,6 +263,7 @@ class Config:
     caps: PositionCaps = field(default_factory=PositionCaps)
     options: OptionsFilters = field(default_factory=OptionsFilters)
     weights: SentimentWeights = field(default_factory=SentimentWeights)
+    costs: MarketCosts = field(default_factory=MarketCosts)
 
     # options management (not an entry filter, so it lives outside OptionsFilters):
     # close a held option once it is this close to expiry, regardless of P&L --
@@ -234,9 +274,6 @@ class Config:
     stock_tickers: List[str] = field(default_factory=list)
     crypto_core_coins: List[str] = field(default_factory=list)
     crypto_satellite_coins: List[str] = field(default_factory=list)
-
-    # fees
-    taker_fee_pct: float = 0.0025  # 0.25% per side
 
     # risk profile (resolved to a TierParams bundle via engine.risk.get_tier).
     # Non-secret operational tunable -> lives in plain .env as RISK_TIER.
@@ -255,9 +292,10 @@ class Config:
         """Alpaca crypto market symbol, e.g. 'SOL' -> 'SOL/USD'."""
         return f"{coin.upper()}/USD"
 
-    def round_trip_fees(self, size: float) -> float:
-        """Round-trip taker fees for a position of ``size`` notional."""
-        return size * 2 * self.taker_fee_pct
+    def round_trip_fees(self, market: str, size: float) -> float:
+        """Round-trip execution cost in dollars for a ``size``-notional
+        position in ``market`` (see :class:`MarketCosts`)."""
+        return size * self.costs.round_trip_pct(market)
 
     @property
     def is_live_capable_env(self) -> bool:
@@ -298,6 +336,7 @@ class Config:
             caps=PositionCaps.from_env(),
             options=OptionsFilters.from_env(),
             weights=SentimentWeights.from_env(),
+            costs=MarketCosts.from_env(),
             option_exit_dte=_get_int("OPTION_EXIT_DTE", 2),
             stock_tickers=_get_list("STOCK_TICKERS", []),
             crypto_core_coins=_get_list("CRYPTO_CORE_COINS", []),

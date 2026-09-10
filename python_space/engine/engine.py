@@ -372,8 +372,8 @@ class TradingEngine:
                     False,
                     detail,
                 )
-            # 5) expected-value projection gate (must clear fee drag)
-            round_trip_fee = self.config.taker_fee_pct * 2
+            # 5) expected-value projection gate (must clear fee + spread drag)
+            round_trip_fee = self.config.costs.round_trip_pct(market)
             if not ev_positive(tp, sl, advice.projected_win_probability, round_trip_fee):
                 return (
                     False,
@@ -901,7 +901,7 @@ class TradingEngine:
 
         if not place_order:
             notional = qty * price
-            fees = self.config.round_trip_fees(notional) / 2  # entry side only
+            fees = self.config.round_trip_fees(market, notional) / 2  # entry side only
             pos = Position(
                 market=market, symbol=symbol, side=decision.side, qty=qty,
                 leverage=1.0, entry_price=price, current_price=price,
@@ -937,7 +937,7 @@ class TradingEngine:
         filled_qty = result.filled_qty
         filled_price = result.filled_price or price
         notional = filled_qty * filled_price
-        fees = self.config.round_trip_fees(notional) / 2
+        fees = self.config.round_trip_fees(market, notional) / 2
         pos = Position(
             market=market, symbol=symbol, side=decision.side, qty=filled_qty,
             leverage=1.0, entry_price=filled_price, current_price=filled_price,
@@ -962,7 +962,7 @@ class TradingEngine:
 
         if is_simulated:
             pnl = av.position_pnl_pct(pos.side, pos.entry_price, price) * pos.entry_notional
-            exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
+            exit_fees = self.config.round_trip_fees(pos.market, pos.entry_notional) / 2
             pos.status = POSITION_CLOSED
             pos.current_price = price
             pos.realized_pnl = pnl - exit_fees - pos.entry_fees
@@ -993,7 +993,7 @@ class TradingEngine:
         exit_price = result.filled_price or price
         exit_qty = result.filled_qty
         pnl = av.position_pnl_pct(pos.side, pos.entry_price, exit_price) * pos.entry_notional
-        exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
+        exit_fees = self.config.round_trip_fees(pos.market, pos.entry_notional) / 2
         pos.status = POSITION_CLOSED
         pos.current_price = exit_price
         pos.realized_pnl = pnl - exit_fees - pos.entry_fees
