@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from config import Config, get_config
 from sentiment.aggregator import SentimentAggregator
@@ -41,7 +42,9 @@ from .models import (
     MARKET_STOCK,
     POSITION_CLOSED,
     POSITION_OPEN,
+    SIDE_SHORT,
     TRADE_FILLED,
+    TRADE_REJECTED,
     BotConfig,
     Position,
     SignalLog,
@@ -59,6 +62,21 @@ POSITION_BUDGET_USD = float(os.environ.get("POSITION_BUDGET_USD", "100") or "100
 
 def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _norm_symbol(symbol: str) -> str:
+    """Normalize a symbol for cross-referencing DB rows against broker
+    positions (crypto positions list without the pair slash, e.g. ``SOLUSD``
+    for the ``SOL/USD`` order symbol)."""
+    return (symbol or "").replace("/", "").upper()
+
+
+# Alpaca position ``asset_class`` -> our market vocabulary, for reconciliation.
+_ASSET_CLASS_MARKET = {
+    "crypto": MARKET_CRYPTO,
+    "us_equity": MARKET_STOCK,
+    "us_option": MARKET_OPTION,
+}
 
 
 class ConsecutiveLossTracker:
@@ -351,6 +369,72 @@ class TradingEngine:
             )
         )
 
+    def _record_open_outcome(self, session, report, status, err, market, symbol, sent, reason):
+        """Translate an ``_open_position``/``_open_option_position`` result
+        (``"opened" | "skip" | "rejected"``, reason) into report counters and
+        a signal-log row, shared by all three cycles."""
+        if status == "opened":
+            report.opened += 1
+            self._log_signal(session, market, symbol, sent.score, sent.label, True, reason)
+        elif status == "skip":
+            report.skipped += 1
+            self._log_signal(session, market, symbol, sent.score, sent.label, False, err)
+        else:  # "rejected"
+            report.errors.append(f"{market} open rejected for {symbol}: {err}")
+            self._log_signal(session, market, symbol, sent.score, sent.label, False, err)
+
+    # -- reconciliation -------------------------------------------------------
+    def reconcile(self, session, market: str) -> List[str]:
+        """Align the DB's open positions for ``market`` with what Alpaca holds.
+
+        Called at the top of every cycle, before exits/entries run, so a
+        position the broker no longer shows (e.g. it was closed out-of-band,
+        or an earlier close silently failed at the DB layer) doesn't sit open
+        forever. Simulated (confidence-gate paper) positions never touched the
+        broker, so they are left alone entirely. This never opens or closes a
+        real position on its own -- an unrecognized broker position is only
+        ever reported, never adopted or auto-closed.
+        """
+        warnings: List[str] = []
+        db_positions = self._open_positions(session, market)
+        db_symbols = set()
+        for pos in db_positions:
+            if pos.extra and pos.extra.get("simulated"):
+                continue
+            db_symbols.add(_norm_symbol(pos.symbol))
+            qty = self.alpaca.get_position_qty(pos.symbol)
+            if not qty:
+                pos.status = POSITION_CLOSED
+                pos.realized_pnl = 0.0
+                pos.closed_at = _utcnow()
+                extra = dict(pos.extra or {})
+                extra["reconciled"] = "missing_at_broker"
+                pos.extra = extra
+                session.commit()
+                msg = f"{market} position {pos.symbol} missing at broker; marked reconciled/closed"
+                logger.warning(msg)
+                warnings.append(msg)
+
+        try:
+            broker_positions = self.alpaca.list_positions()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("reconcile: list_positions failed: %s", exc)
+            broker_positions = []
+        for bp in broker_positions or []:
+            bsym = getattr(bp, "symbol", None)
+            if not bsym:
+                continue
+            asset_class = str(getattr(bp, "asset_class", "") or "").lower()
+            bp_market = _ASSET_CLASS_MARKET.get(asset_class)
+            if bp_market != market:
+                continue
+            if _norm_symbol(bsym) not in db_symbols:
+                msg = f"broker {market} position {bsym} has no matching DB row (not managed)"
+                logger.warning(msg)
+                warnings.append(msg)
+
+        return warnings
+
     # -- crypto -------------------------------------------------------------
     def run_crypto_cycle(self) -> CycleReport:
         report = CycleReport(market=MARKET_CRYPTO, mode=self.mode)
@@ -360,6 +444,8 @@ class TradingEngine:
 
         session = self.session_factory()
         try:
+            report.errors.extend(self.reconcile(session, MARKET_CRYPTO))
+
             # 1) manage exits
             for pos in self._open_positions(session, MARKET_CRYPTO):
                 coin = pos.symbol.split("/")[0]
@@ -374,8 +460,11 @@ class TradingEngine:
                     stop_loss_pct=self.tier.crypto_stop_loss_pct,
                 )
                 if decision.is_close:
-                    self._close_position(session, pos, price, decision.reason)
-                    report.closed += 1
+                    if self._close_position(session, pos, price, decision.reason):
+                        report.closed += 1
+                    else:
+                        report.held += 1
+                        report.errors.append(f"close rejected for {pos.symbol}")
                 else:
                     report.held += 1
 
@@ -407,12 +496,14 @@ class TradingEngine:
                         continue
                     price = self.alpaca.get_crypto_price(symbol)
                     if price:
-                        self._open_position(
+                        status, err = self._open_position(
                             session, MARKET_CRYPTO, symbol, decision, price,
                             place_order=not paper_only,
                         )
-                        report.opened += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, True, reason)
+                        self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, reason)
+                    else:
+                        report.skipped += 1
+                        self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
                 else:
                     report.skipped += 1
                     self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
@@ -438,6 +529,8 @@ class TradingEngine:
 
         session = self.session_factory()
         try:
+            report.errors.extend(self.reconcile(session, MARKET_STOCK))
+
             for pos in self._open_positions(session, MARKET_STOCK):
                 price = self.alpaca.get_stock_price(pos.symbol)
                 if price is None:
@@ -450,8 +543,11 @@ class TradingEngine:
                     stop_loss_pct=self.tier.stock_stop_loss_pct,
                 )
                 if decision.is_close:
-                    self._close_position(session, pos, price, decision.reason)
-                    report.closed += 1
+                    if self._close_position(session, pos, price, decision.reason):
+                        report.closed += 1
+                    else:
+                        report.held += 1
+                        report.errors.append(f"close rejected for {pos.symbol}")
                 else:
                     report.held += 1
 
@@ -478,12 +574,14 @@ class TradingEngine:
                         continue
                     price = self.alpaca.get_stock_price(ticker)
                     if price:
-                        self._open_position(
+                        status, err = self._open_position(
                             session, MARKET_STOCK, ticker, decision, price,
                             place_order=not paper_only,
                         )
-                        report.opened += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, True, reason)
+                        self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, reason)
+                    else:
+                        report.skipped += 1
+                        self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
                 else:
                     report.skipped += 1
                     self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
@@ -509,14 +607,19 @@ class TradingEngine:
 
         session = self.session_factory()
         try:
+            report.errors.extend(self.reconcile(session, MARKET_OPTION))
+
             # 1) manage open option positions via the premium ladder
             for pos in self._open_positions(session, MARKET_OPTION):
                 # For a real fill we'd re-quote pos.symbol; premium tracked in current_price.
                 current_premium = pos.current_price or pos.entry_price
                 action = opt.exit_decision(pos.entry_price, current_premium)
                 if action:
-                    self._close_option_position(session, pos, current_premium, action)
-                    report.closed += 1
+                    if self._close_option_position(session, pos, current_premium, action):
+                        report.closed += 1
+                    else:
+                        report.held += 1
+                        report.errors.append(f"close rejected for {pos.symbol}")
                 else:
                     report.held += 1
 
@@ -561,12 +664,14 @@ class TradingEngine:
                 if n < 1:
                     report.skipped += 1
                     continue
-                self._open_option_position(
+                status, err = self._open_option_position(
                     session, underlying, side, choice, n, sent.score,
                     place_order=not paper_only,
                 )
-                report.opened += 1
-                self._log_signal(session, MARKET_OPTION, choice.contract.symbol, sent.score, sent.label, True, reason)
+                self._record_open_outcome(
+                    session, report, status, err, MARKET_OPTION,
+                    choice.contract.symbol, sent, reason,
+                )
 
             session.commit()
         except Exception as exc:  # pragma: no cover - defensive
@@ -590,52 +695,135 @@ class TradingEngine:
         return self._count_open(session, market) < per_market
 
     # -- position lifecycle -------------------------------------------------
-    def _open_position(self, session, market, symbol, decision, price, place_order: bool = True):
-        # size with the active risk tier's per-position budget
+    def _open_position(
+        self, session, market, symbol, decision, price, place_order: bool = True
+    ) -> Tuple[str, Optional[str]]:
+        """Open a crypto/stock position. Returns ``(status, reason)`` where
+        ``status`` is ``"opened" | "skip" | "rejected"``.
+
+        Simulated (``place_order=False``) entries never touch the broker and
+        always succeed. Real entries submit first and only persist a
+        ``Position`` once the broker confirms a fill; a rejection persists a
+        rejected ``Trade`` but no ``Position``.
+        """
         budget = self.tier.position_budget_usd
-        qty = budget / price if price else 0.0
-        notional = qty * price
-        fees = self.config.round_trip_fees(notional) / 2  # entry side only
-        gate_mode = self.mode if place_order else "paper"
+
+        if market == MARKET_STOCK and decision.side == SIDE_SHORT:
+            # Alpaca does not accept fractional short sales.
+            qty = float(math.floor(budget / price)) if price else 0.0
+            if qty < 1:
+                return "skip", "short requires whole shares"
+        else:
+            qty = budget / price if price else 0.0
+
+        if not place_order:
+            notional = qty * price
+            fees = self.config.round_trip_fees(notional) / 2  # entry side only
+            pos = Position(
+                market=market, symbol=symbol, side=decision.side, qty=qty,
+                leverage=1.0, entry_price=price, current_price=price,
+                entry_notional=notional, entry_fees=fees,
+                sentiment_score=decision.score, status=POSITION_OPEN,
+                extra={"simulated": True},
+            )
+            session.add(pos)
+            session.add(Trade(
+                market=market, symbol=symbol, side=decision.side, action="open",
+                qty=qty, price=price, notional=notional, fees=fees,
+                status=TRADE_FILLED, mode="sim", reason=decision.reason,
+            ))
+            session.commit()
+            return "opened", None
+
+        if market == MARKET_CRYPTO:
+            result = self.alpaca.submit_crypto_order(symbol, "buy", qty)
+        else:
+            side_str = "buy" if decision.side == "long" else "sell"
+            result = self.alpaca.submit_stock_order(symbol, side_str, qty)
+
+        if not result.ok:
+            session.add(Trade(
+                market=market, symbol=symbol, side=decision.side, action="open",
+                qty=qty, price=price, notional=qty * price, fees=0.0,
+                order_id=result.order_id, status=TRADE_REJECTED,
+                mode=self.mode, reason=result.error,
+            ))
+            session.commit()
+            return "rejected", result.error
+
+        filled_qty = result.filled_qty
+        filled_price = result.filled_price or price
+        notional = filled_qty * filled_price
+        fees = self.config.round_trip_fees(notional) / 2
         pos = Position(
-            market=market, symbol=symbol, side=decision.side, qty=qty,
-            leverage=1.0, entry_price=price, current_price=price,
+            market=market, symbol=symbol, side=decision.side, qty=filled_qty,
+            leverage=1.0, entry_price=filled_price, current_price=filled_price,
             entry_notional=notional, entry_fees=fees,
             sentiment_score=decision.score, status=POSITION_OPEN,
         )
         session.add(pos)
         session.add(Trade(
             market=market, symbol=symbol, side=decision.side, action="open",
-            qty=qty, price=price, notional=notional, fees=fees,
-            status=TRADE_FILLED, mode=gate_mode, reason=decision.reason,
+            qty=filled_qty, price=filled_price, notional=notional, fees=fees,
+            order_id=result.order_id, status=TRADE_FILLED,
+            mode=self.mode, reason=decision.reason,
         ))
-        # place the real order (paper or live per endpoint). When the confidence
-        # gate is still validating this tier, skip the order entirely (paper-only).
-        if not place_order:
-            return
-        if market == MARKET_CRYPTO:
-            self.alpaca.submit_crypto_order(symbol, "buy", qty)
-        else:
-            self.alpaca.submit_stock_order(symbol, "buy" if decision.side == "long" else "sell", qty)
+        session.commit()
+        return "opened", None
 
-    def _close_position(self, session, pos: Position, price: float, reason: str):
-        pnl = av.position_pnl_pct(pos.side, pos.entry_price, price) * pos.entry_notional
+    def _close_position(self, session, pos: Position, price: float, reason: str) -> bool:
+        """Close a crypto/stock position. Returns True once the position is
+        actually closed (simulated or a confirmed broker fill); False leaves
+        the position open (a real close was rejected)."""
+        is_simulated = bool(pos.extra and pos.extra.get("simulated"))
+
+        if is_simulated:
+            pnl = av.position_pnl_pct(pos.side, pos.entry_price, price) * pos.entry_notional
+            exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
+            pos.status = POSITION_CLOSED
+            pos.current_price = price
+            pos.realized_pnl = pnl - exit_fees - pos.entry_fees
+            pos.closed_at = _utcnow()
+            session.add(Trade(
+                market=pos.market, symbol=pos.symbol, side=pos.side, action="close",
+                qty=pos.qty, price=price, notional=pos.qty * price, fees=exit_fees,
+                pnl=pos.realized_pnl, status=TRADE_FILLED, mode="sim", reason=reason,
+            ))
+            self._record_outcome(session, pos.market, pos.realized_pnl)
+            session.commit()
+            return True
+
+        # Real position: let Alpaca close whatever it actually holds (handles
+        # long/short direction and a crypto qty that has drifted from pos.qty
+        # due to fees paid in the asset received).
+        result = self.alpaca.close_position(pos.symbol)
+        if not result.ok:
+            session.add(Trade(
+                market=pos.market, symbol=pos.symbol, side=pos.side, action="close",
+                qty=pos.qty, price=price, notional=pos.qty * price, fees=0.0,
+                order_id=result.order_id, status=TRADE_REJECTED,
+                mode=self.mode, reason=result.error,
+            ))
+            session.commit()
+            return False
+
+        exit_price = result.filled_price or price
+        exit_qty = result.filled_qty
+        pnl = av.position_pnl_pct(pos.side, pos.entry_price, exit_price) * pos.entry_notional
         exit_fees = self.config.round_trip_fees(pos.entry_notional) / 2
         pos.status = POSITION_CLOSED
-        pos.current_price = price
+        pos.current_price = exit_price
         pos.realized_pnl = pnl - exit_fees - pos.entry_fees
-        import datetime as _dt
-        pos.closed_at = _dt.datetime.now(_dt.timezone.utc)
+        pos.closed_at = _utcnow()
         session.add(Trade(
             market=pos.market, symbol=pos.symbol, side=pos.side, action="close",
-            qty=pos.qty, price=price, notional=pos.qty * price, fees=exit_fees,
-            pnl=pos.realized_pnl, status=TRADE_FILLED, mode=self.mode, reason=reason,
+            qty=exit_qty, price=exit_price, notional=exit_qty * exit_price, fees=exit_fees,
+            order_id=result.order_id, pnl=pos.realized_pnl, status=TRADE_FILLED,
+            mode=self.mode, reason=reason,
         ))
-        if pos.market == MARKET_CRYPTO:
-            self.alpaca.submit_crypto_order(pos.symbol, "sell", pos.qty)
-        else:
-            self.alpaca.submit_stock_order(pos.symbol, "sell" if pos.side == "long" else "buy", pos.qty)
         self._record_outcome(session, pos.market, pos.realized_pnl)
+        session.commit()
+        return True
 
     def _record_outcome(self, session, market: str, realized_pnl: float) -> None:
         """Feed a closed trade's result into the risk state machines.
@@ -651,13 +839,54 @@ class TradingEngine:
         if self.conf_gate.is_active(market, self.tier, session):
             self.conf_gate.record_paper_trade(market, self.tier, won, session)
 
-    def _open_option_position(self, session, underlying, side, choice, contracts, score, place_order: bool = True):
+    def _open_option_position(
+        self, session, underlying, side, choice, contracts, score, place_order: bool = True
+    ) -> Tuple[str, Optional[str]]:
+        """Open a long option position. Returns ``(status, reason)`` where
+        ``status`` is ``"opened" | "rejected"`` (options never short, so there
+        is no whole-share sizing skip)."""
         premium = choice.premium
-        cost = premium * opt.CONTRACT_MULTIPLIER * contracts
+
+        if not place_order:
+            cost = premium * opt.CONTRACT_MULTIPLIER * contracts
+            pos = Position(
+                market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
+                qty=contracts, leverage=float(contracts), entry_price=premium,
+                current_price=premium, entry_notional=cost, entry_fees=0.0,
+                underlying=underlying, strike=choice.contract.strike,
+                option_type=side, expiration=choice.contract.expiration,
+                sentiment_score=score, status=POSITION_OPEN,
+                extra={"simulated": True},
+            )
+            session.add(pos)
+            session.add(Trade(
+                market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
+                action="open", qty=contracts, price=premium, notional=cost, fees=0.0,
+                status=TRADE_FILLED, mode="sim",
+                reason=f"{side} entry, score {score:.3f}",
+            ))
+            session.commit()
+            return "opened", None
+
+        result = self.alpaca.submit_option_order(choice.contract.symbol, "buy", contracts)
+        if not result.ok:
+            session.add(Trade(
+                market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
+                action="open", qty=contracts, price=premium,
+                notional=premium * opt.CONTRACT_MULTIPLIER * contracts, fees=0.0,
+                order_id=result.order_id, status=TRADE_REJECTED,
+                mode=self.mode, reason=result.error,
+            ))
+            session.commit()
+            return "rejected", result.error
+
+        filled_qty = result.filled_qty or contracts
+        filled_price = result.filled_price or premium
+        cost = filled_price * opt.CONTRACT_MULTIPLIER * filled_qty
         pos = Position(
             market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
-            qty=contracts, leverage=float(contracts), entry_price=premium,
-            current_price=premium, entry_notional=cost, entry_fees=0.0,
+            qty=filled_qty, leverage=float(filled_qty), entry_price=filled_price,
+            current_price=filled_price, entry_notional=cost, entry_fees=0.0,
             underlying=underlying, strike=choice.contract.strike,
             option_type=side, expiration=choice.contract.expiration,
             sentiment_score=score, status=POSITION_OPEN,
@@ -665,30 +894,63 @@ class TradingEngine:
         session.add(pos)
         session.add(Trade(
             market=MARKET_OPTION, symbol=choice.contract.symbol, side="long",
-            action="open", qty=contracts, price=premium, notional=cost, fees=0.0,
-            status=TRADE_FILLED, mode=self.mode if place_order else "paper",
+            action="open", qty=filled_qty, price=filled_price, notional=cost, fees=0.0,
+            order_id=result.order_id, status=TRADE_FILLED, mode=self.mode,
             reason=f"{side} entry, score {score:.3f}",
         ))
-        # skip the real order while the confidence gate is paper-validating.
-        if place_order:
-            self.alpaca.submit_option_order(choice.contract.symbol, "buy", contracts)
+        session.commit()
+        return "opened", None
 
-    def _close_option_position(self, session, pos: Position, current_premium: float, action: str):
+    def _close_option_position(self, session, pos: Position, current_premium: float, action: str) -> bool:
+        """Close a long option position. Returns True once actually closed
+        (simulated or a confirmed broker fill); False leaves it open."""
+        is_simulated = bool(pos.extra and pos.extra.get("simulated"))
         contracts = pos.leverage or pos.qty
-        pnl = opt.option_pnl(pos.entry_price, current_premium, contracts)
+
+        if is_simulated:
+            pnl = opt.option_pnl(pos.entry_price, current_premium, contracts)
+            pos.status = POSITION_CLOSED
+            pos.current_price = current_premium
+            pos.realized_pnl = pnl
+            pos.closed_at = _utcnow()
+            session.add(Trade(
+                market=MARKET_OPTION, symbol=pos.symbol, side="long", action="close",
+                qty=contracts, price=current_premium,
+                notional=current_premium * opt.CONTRACT_MULTIPLIER * contracts,
+                fees=0.0, pnl=pnl, status=TRADE_FILLED, mode="sim", reason=action,
+            ))
+            self._record_outcome(session, pos.market, pos.realized_pnl)
+            session.commit()
+            return True
+
+        result = self.alpaca.close_position(pos.symbol)
+        if not result.ok:
+            session.add(Trade(
+                market=MARKET_OPTION, symbol=pos.symbol, side="long", action="close",
+                qty=contracts, price=current_premium, notional=0.0, fees=0.0,
+                order_id=result.order_id, status=TRADE_REJECTED,
+                mode=self.mode, reason=result.error,
+            ))
+            session.commit()
+            return False
+
+        exit_premium = result.filled_price or current_premium
+        exit_contracts = result.filled_qty or contracts
+        pnl = opt.option_pnl(pos.entry_price, exit_premium, exit_contracts)
         pos.status = POSITION_CLOSED
-        pos.current_price = current_premium
+        pos.current_price = exit_premium
         pos.realized_pnl = pnl
-        import datetime as _dt
-        pos.closed_at = _dt.datetime.now(_dt.timezone.utc)
+        pos.closed_at = _utcnow()
         session.add(Trade(
             market=MARKET_OPTION, symbol=pos.symbol, side="long", action="close",
-            qty=contracts, price=current_premium,
-            notional=current_premium * opt.CONTRACT_MULTIPLIER * contracts,
-            fees=0.0, pnl=pnl, status=TRADE_FILLED, mode=self.mode, reason=action,
+            qty=exit_contracts, price=exit_premium,
+            notional=exit_premium * opt.CONTRACT_MULTIPLIER * exit_contracts,
+            order_id=result.order_id, fees=0.0, pnl=pnl, status=TRADE_FILLED,
+            mode=self.mode, reason=action,
         ))
-        self.alpaca.submit_option_order(pos.symbol, "sell", int(contracts))
         self._record_outcome(session, pos.market, pos.realized_pnl)
+        session.commit()
+        return True
 
     # -- convenience --------------------------------------------------------
     def ensure_schema(self):

@@ -21,10 +21,15 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
 logger = logging.getLogger("scalpbot.engine.alpaca")
+
+# Order statuses that mean "the broker is done deciding" -- stop polling.
+_TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected", "done_for_day"}
 
 
 @dataclass
@@ -76,6 +81,8 @@ class AlpacaClient:
         secret_key: Optional[str] = None,
         paper: bool = True,
         lazy: bool = False,
+        order_poll_timeout: Optional[float] = None,
+        order_poll_interval: Optional[float] = None,
     ):
         self.api_key = api_key or os.environ.get("ALPACA_API_KEY")
         self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY")
@@ -85,6 +92,16 @@ class AlpacaClient:
         self._stock_data = None
         self._option_data = None
         self._sdk = None
+        self.order_poll_timeout = (
+            order_poll_timeout
+            if order_poll_timeout is not None
+            else float(os.environ.get("ORDER_POLL_TIMEOUT_SECONDS", "10") or "10")
+        )
+        self.order_poll_interval = (
+            order_poll_interval
+            if order_poll_interval is not None
+            else float(os.environ.get("ORDER_POLL_INTERVAL_SECONDS", "0.5") or "0.5")
+        )
         if not lazy:
             self._ensure()
 
@@ -247,22 +264,58 @@ class AlpacaClient:
                 symbol=symbol,
                 side=order_side,
                 time_in_force=tif,
-                **({"qty": qty}),
+                qty=qty,
+                client_order_id=f"scalpbot-{uuid.uuid4()}",
             )
             order = self._trading.submit_order(req)
-            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
-            filled_avg = float(getattr(order, "filled_avg_price", 0) or 0)
-            return OrderResult(
-                ok=True,
-                order_id=str(order.id),
-                filled_qty=filled_qty,
-                filled_price=filled_avg,
-                status=str(getattr(order, "status", "")),
-                raw=order,
-            )
+            order = self._poll_order(order)
+            return self._order_result_from(order)
         except Exception as exc:  # pragma: no cover - network dependent
             logger.error("submit order %s %s %s failed: %s", market, symbol, side, exc)
             return OrderResult(ok=False, error=str(exc))
+
+    # -- order fill polling --------------------------------------------------
+    @staticmethod
+    def _status_of(order) -> str:
+        status = getattr(order, "status", "")
+        value = getattr(status, "value", status)
+        return str(value).lower()
+
+    def _poll_order(self, order):
+        """Poll ``get_order_by_id`` until the order is terminal or times out.
+
+        A ``partially_filled`` order still sitting open at the timeout is
+        returned as-is; the caller treats any positive ``filled_qty`` as ok.
+        Never raises -- returns the last order state seen on any failure.
+        """
+        order_id = getattr(order, "id", None)
+        if order_id is None:
+            return order
+        deadline = time.monotonic() + self.order_poll_timeout
+        current = order
+        while self._status_of(current) not in _TERMINAL_STATUSES:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.order_poll_interval)
+            try:
+                current = self._trading.get_order_by_id(order_id)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.warning("get_order_by_id(%s) failed: %s", order_id, exc)
+                break
+        return current
+
+    def _order_result_from(self, order) -> OrderResult:
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        filled_avg = float(getattr(order, "filled_avg_price", 0) or 0)
+        order_id = getattr(order, "id", None)
+        return OrderResult(
+            ok=filled_qty > 0,
+            order_id=str(order_id) if order_id is not None else None,
+            filled_qty=filled_qty,
+            filled_price=filled_avg,
+            status=self._status_of(order),
+            raw=order,
+        )
 
     # -- account/positions --------------------------------------------------
     def get_account(self):  # pragma: no cover - network dependent
@@ -276,3 +329,37 @@ class AlpacaClient:
         except Exception as exc:
             logger.warning("list_positions failed: %s", exc)
             return []
+
+    def get_position_qty(self, symbol: str) -> Optional[float]:
+        """Broker-held qty for ``symbol``, or ``None`` if there is no position.
+
+        Crypto positions are listed without the pair slash (orders use
+        ``SOL/USD``, positions show ``SOLUSD``), so the symbol is normalized
+        before the lookup.
+        """
+        self._ensure()
+        try:
+            norm = symbol.replace("/", "")
+            pos = self._trading.get_open_position(norm)
+            return float(getattr(pos, "qty", 0) or 0)
+        except Exception as exc:
+            logger.warning("get_position_qty(%s) failed: %s", symbol, exc)
+            return None
+
+    def close_position(self, symbol: str) -> OrderResult:
+        """Close 100% of whatever the broker actually holds for ``symbol``.
+
+        Delegates direction and quantity entirely to Alpaca's close-position
+        endpoint, so it is correct for both long and short positions and for
+        crypto positions whose held quantity has drifted from the recorded
+        entry size (fees are paid in the asset received). Never raises.
+        """
+        self._ensure()
+        try:
+            norm = symbol.replace("/", "")
+            order = self._trading.close_position(norm)
+            order = self._poll_order(order)
+            return self._order_result_from(order)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.error("close_position(%s) failed: %s", symbol, exc)
+            return OrderResult(ok=False, error=str(exc))
