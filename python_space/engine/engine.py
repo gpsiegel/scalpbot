@@ -560,6 +560,7 @@ class TradingEngine:
                 take_profit_pct=self.tier.crypto_take_profit_pct,
                 stop_loss_pct=self.tier.crypto_stop_loss_pct,
                 actionable=sent.actionable,
+                reversal_threshold=self.tier.entry_score_threshold,
             )
             if decision.is_close:
                 if self._close_position(session, pos, price, decision.reason):
@@ -650,6 +651,7 @@ class TradingEngine:
                 take_profit_pct=self.tier.stock_take_profit_pct,
                 stop_loss_pct=self.tier.stock_stop_loss_pct,
                 actionable=sent.actionable,
+                reversal_threshold=self.tier.entry_score_threshold,
             )
             if decision.is_close:
                 if self._close_position(session, pos, price, decision.reason):

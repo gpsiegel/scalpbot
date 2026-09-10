@@ -136,6 +136,7 @@ def linear_exit_decision(
     take_profit_pct: Optional[float] = None,
     stop_loss_pct: Optional[float] = None,
     actionable: bool = True,
+    reversal_threshold: Optional[float] = None,
 ) -> AvenueDecision:
     """Exit logic shared by crypto and stock (price + sentiment reversal).
 
@@ -147,9 +148,17 @@ def linear_exit_decision(
     price-based take-profit/stop-loss always apply, but when the aggregated
     sentiment behind ``score`` doesn't have enough source coverage to trust
     (see sentiment.aggregator), a reversal is never inferred from it.
+
+    ``reversal_threshold`` is how far the score must swing against the
+    position to count as a reversal. The engine passes the *active risk
+    tier's* ``entry_score_threshold`` here, so a HIGH-tier position (which
+    needed a 0.30 score to open) reverses at 0.30, not a fixed module-level
+    default that ignores which tier actually opened it. When omitted, both
+    the long and short checks fall back to :data:`STOCK_ENTRY_SCORE`.
     """
     tp = TAKE_PROFIT_PCT if take_profit_pct is None else take_profit_pct
     sl = STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
+    rev = STOCK_ENTRY_SCORE if reversal_threshold is None else reversal_threshold
     pnl = position_pnl_pct(side, entry_price, current_price)
 
     if pnl >= tp:
@@ -164,12 +173,12 @@ def linear_exit_decision(
         )
     # sentiment reversal (only when the sentiment behind `score` is actionable)
     if actionable:
-        if side == SIDE_LONG and score < SENTIMENT_FLIP - CRYPTO_ENTRY_SCORE:
+        if side == SIDE_LONG and score < SENTIMENT_FLIP - rev:
             return AvenueDecision(
                 action="close", market=market, symbol=symbol, side=side, score=score,
                 reason=f"sentiment reversed to {score:.3f}",
             )
-        if side == SIDE_SHORT and score > SENTIMENT_FLIP + STOCK_ENTRY_SCORE:
+        if side == SIDE_SHORT and score > SENTIMENT_FLIP + rev:
             return AvenueDecision(
                 action="close", market=market, symbol=symbol, side=side, score=score,
                 reason=f"sentiment reversed to {score:.3f}",

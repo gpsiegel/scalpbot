@@ -218,6 +218,19 @@ def test_linear_exit_take_profit_and_stop():
     assert hold.action == "hold"
 
 
+def test_linear_exit_reversal_uses_given_threshold_not_a_fixed_default():
+    # score -0.20 reverses at the default fixed 0.15 threshold...
+    default = av.linear_exit_decision("crypto", "SOL/USD", "long", 100.0, 100.5, -0.20)
+    assert default.is_close and "reversed" in default.reason
+    # ...but a HIGH-tier position (which needed 0.30 conviction to open) is
+    # held instead: -0.20 hasn't reversed far enough against a 0.30 bar.
+    high_tier = av.linear_exit_decision(
+        "crypto", "SOL/USD", "long", 100.0, 100.5, -0.20,
+        reversal_threshold=0.30,
+    )
+    assert high_tier.action == "hold"
+
+
 def test_position_pnl_direction():
     assert av.position_pnl_pct("long", 100, 110) == pytest.approx(0.10)
     assert av.position_pnl_pct("short", 100, 90) == pytest.approx(0.10)
