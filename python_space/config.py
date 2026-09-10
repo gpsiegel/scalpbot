@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
-from sentiment.base import COIN_METADATA
+from sentiment.base import COIN_METADATA, EQUITY_CAPABLE_SOURCES
 
 logger = logging.getLogger("scalpbot.config")
 
@@ -312,6 +312,13 @@ class Config:
             problems.append("ENABLE_CRYPTO is on but no CRYPTO_CORE/SATELLITE coins configured")
         if self.avenues.stocks and not self.stock_tickers:
             problems.append("ENABLE_STOCKS is on but STOCK_TICKERS is empty")
+        if (self.avenues.stocks or self.avenues.options) and not EQUITY_CAPABLE_SOURCES:
+            problems.append(
+                "ENABLE_STOCKS/ENABLE_OPTIONS is on but no sentiment source is "
+                "equity-capable (every source but fear_greed only resolves crypto "
+                "tickers, and fear_greed is a market-wide crypto index) -- "
+                "stocks/options would trade on an insufficient-coverage signal"
+            )
 
         if self.app_env == "prod" and self.paper_trading is False and self.live_trading:
             # live trading is intentional here; nothing to warn about

@@ -33,7 +33,11 @@ def test_defaults():
     assert c.app_env == "nonprod"
     assert c.paper_trading is True
     assert c.live_trading is False
-    assert c.avenues.crypto and c.avenues.stocks and c.avenues.options
+    # Stocks/options are off by default (no equity-capable sentiment source
+    # yet -- see sentiment.base.EQUITY_CAPABLE_SOURCES); crypto stays on.
+    assert c.avenues.crypto is True
+    assert c.avenues.stocks is False
+    assert c.avenues.options is False
     assert c.caps.total == 3
     assert c.options.min_dte == 7
     assert c.taker_fee_pct == 0.0025
@@ -86,6 +90,7 @@ def test_validate_flags_unknown_coin(monkeypatch):
 
 def test_validate_flags_empty_universes(monkeypatch):
     # crypto on but no coins, stocks on but no tickers
+    monkeypatch.setenv("ENABLE_STOCKS", "true")
     problems = Config.from_env().validate()
     assert any("CRYPTO" in p for p in problems)
     assert any("STOCK_TICKERS" in p for p in problems)
@@ -94,8 +99,19 @@ def test_validate_flags_empty_universes(monkeypatch):
 def test_validate_clean_with_known_coins(monkeypatch):
     monkeypatch.setenv("CRYPTO_CORE_COINS", "BTC,ETH,SOL,DOGE")
     monkeypatch.setenv("STOCK_TICKERS", "SCHD,XLF")
+    monkeypatch.setenv("ENABLE_STOCKS", "false")
     monkeypatch.setenv("ENABLE_OPTIONS", "false")
     assert Config.from_env().validate() == []
+
+
+def test_validate_flags_stocks_enabled_without_equity_sentiment(monkeypatch):
+    # Stocks/options currently have no equity-capable sentiment source (every
+    # source but fear_greed is crypto-only) -- enabling either must warn.
+    monkeypatch.setenv("ENABLE_STOCKS", "true")
+    monkeypatch.setenv("STOCK_TICKERS", "SCHD")
+    monkeypatch.setenv("ENABLE_OPTIONS", "false")
+    problems = Config.from_env().validate()
+    assert any("equity-capable" in p for p in problems)
 
 
 def test_toggle_off(monkeypatch):

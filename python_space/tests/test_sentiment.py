@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sentiment.aggregator import SentimentAggregator, load_weights  # noqa: E402
@@ -88,12 +90,97 @@ def test_renormalization_when_sources_drop():
     assert "fear_greed" not in res.sources_available
 
 
-def test_all_unavailable_is_neutral():
+def test_all_unavailable_is_insufficient_data():
+    # A fully-blind aggregator (0% coverage) must not be mistaken for a
+    # genuinely neutral market -- that was exactly the bug PR2 fixes.
     sources = {"reddit": _StubSource("reddit", 1.0, available=False)}
     agg = SentimentAggregator(sources=sources, weights={"reddit": 0.30})
     res = agg.get_sentiment("SOL")
     assert res.score == 0.0
-    assert res.label == "neutral"
+    assert res.actionable is False
+    assert res.label == "insufficient_data"
+
+
+def test_low_coverage_stock_ticker_is_not_actionable():
+    # Reproduces the PR2 bug: only fear_greed resolves a stock ticker, and its
+    # weight alone (0.07 of 1.00) is far short of the 0.5 coverage floor.
+    sources = {
+        "reddit": _StubSource("reddit", 0.0, available=False),
+        "cryptocurrency_cv": _StubSource("cryptocurrency_cv", 0.0, available=False),
+        "coingecko": _StubSource("coingecko", 0.0, available=False),
+        "lunarcrush": _StubSource("lunarcrush", 0.0, available=False),
+        "google_trends": _StubSource("google_trends", 0.0, available=False),
+        "fear_greed": _StubSource("fear_greed", 0.65),
+    }
+    agg = SentimentAggregator(sources=sources, weights=load_weights())
+    res = agg.get_sentiment("PLTR")
+    assert res.actionable is False
+    assert res.score == 0.0
+    assert res.label == "insufficient_data"
+
+
+def test_sufficient_crypto_coverage_is_actionable():
+    sources = {
+        "reddit": _StubSource("reddit", 0.5),
+        "cryptocurrency_cv": _StubSource("cryptocurrency_cv", 0.5),
+        "coingecko": _StubSource("coingecko", 0.5),
+    }
+    weights = {"reddit": 0.30, "cryptocurrency_cv": 0.25, "coingecko": 0.20,
+               "lunarcrush": 0.10, "google_trends": 0.08, "fear_greed": 0.07}
+    agg = SentimentAggregator(sources=sources, weights=weights)
+    res = agg.get_sentiment("SOL")
+    assert res.coverage == pytest.approx(0.75 / 1.00)
+    assert res.actionable is True
+
+
+def test_ttl_cache_avoids_refetch_within_ttl():
+    calls = {"n": 0}
+
+    class CountingSource(BaseSentimentSource):
+        name = "reddit"
+
+        def _fetch(self, coin):
+            calls["n"] += 1
+            return SentimentSignal(source=self.name, coin=coin, score=0.5, confidence=1.0)
+
+    clock = {"t": 0.0}
+    agg = SentimentAggregator(
+        sources={"reddit": CountingSource()},
+        weights={"reddit": 0.30},
+        ttls={"reddit": 600.0},
+        clock=lambda: clock["t"],
+    )
+    agg.get_sentiment("SOL")
+    clock["t"] = 100.0  # still within the 600s TTL
+    agg.get_sentiment("SOL")
+    assert calls["n"] == 1
+
+    clock["t"] = 601.0  # TTL expired -> refetch
+    agg.get_sentiment("SOL")
+    assert calls["n"] == 2
+
+
+def test_unavailable_result_cached_only_briefly():
+    calls = {"n": 0}
+
+    class FlakySource(BaseSentimentSource):
+        name = "fear_greed"
+
+        def _fetch(self, coin):
+            calls["n"] += 1
+            return SentimentSignal.unavailable(self.name, coin, "down")
+
+    clock = {"t": 0.0}
+    agg = SentimentAggregator(
+        sources={"fear_greed": FlakySource()},
+        weights={"fear_greed": 0.07},
+        ttls={"fear_greed": 3600.0},  # long normal TTL
+        clock=lambda: clock["t"],
+    )
+    agg.get_sentiment("SOL")
+    clock["t"] = 61.0  # well past the ~60s unavailable-result cap, far short of 3600s
+    agg.get_sentiment("SOL")
+    assert calls["n"] == 2
 
 
 def test_env_weight_override(monkeypatch=None):

@@ -134,6 +134,14 @@ COIN_METADATA: Dict[str, Dict[str, Any]] = {
 # Broad crypto subreddits scanned in addition to the coin-specific ones.
 GENERAL_SUBREDDITS = ["CryptoCurrency", "CryptoMarkets"]
 
+# Source keys (see SentimentAggregator._default_sources) that can resolve a
+# non-crypto (stock) ticker rather than raising via coin_meta(). Empty today --
+# every source but fear_greed is crypto-only, and fear_greed is a market-wide
+# crypto index, not equity-specific. Add a source's key here once it actually
+# handles stock tickers; Config.validate() warns while this is empty and
+# ENABLE_STOCKS/ENABLE_OPTIONS are on.
+EQUITY_CAPABLE_SOURCES: frozenset = frozenset()
+
 
 def clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
     """Clamp ``value`` into the ``[low, high]`` interval."""

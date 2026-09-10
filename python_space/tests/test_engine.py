@@ -26,6 +26,7 @@ from engine.models import (  # noqa: E402
     Position,
     POSITION_CLOSED,
     POSITION_OPEN,
+    SignalLog,
     Trade,
     TRADE_REJECTED,
     make_engine,
@@ -37,11 +38,16 @@ from sentiment.aggregator import AggregatedSentiment  # noqa: E402
 # fakes
 # --------------------------------------------------------------------------
 class FakeAgg:
-    def __init__(self, score: float):
+    def __init__(self, score: float, actionable: bool = True, coverage: float = 1.0):
         self.score = score
+        self.actionable = actionable
+        self.coverage = coverage
 
     def get_sentiment(self, coin: str):
-        return AggregatedSentiment(coin=coin.upper(), score=self.score, label="x")
+        return AggregatedSentiment(
+            coin=coin.upper(), score=self.score, label="x",
+            actionable=self.actionable, coverage=self.coverage,
+        )
 
 
 class FakeAlpaca:
@@ -421,6 +427,19 @@ def test_reconcile_closes_missing_broker_position(session_factory):
     assert len(warnings) == 1
     assert pos.status == POSITION_CLOSED
     assert pos.extra["reconciled"] == "missing_at_broker"
+    s.close()
+
+
+def test_no_entry_when_sentiment_not_actionable(session_factory):
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0),
+                      aggregator=FakeAgg(0.9, actionable=False, coverage=0.07))
+    r = e.run_crypto_cycle()
+    assert r.opened == 0
+    assert r.skipped >= 1
+    s = session_factory()
+    logs = s.query(SignalLog).all()
+    assert any("insufficient sentiment coverage" in (log.detail or "") for log in logs)
     s.close()
 
 

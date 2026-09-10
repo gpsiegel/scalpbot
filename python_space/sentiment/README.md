@@ -19,6 +19,49 @@ Weights are **operational config** and live in the plain `.env` file
 unavailable in a cycle, its weight is dropped and the survivors are
 renormalized.
 
+## Coverage and actionability
+
+Every source but Fear & Greed only resolves crypto tickers (calls
+`coin_meta()`, which raises for anything not in `COIN_METADATA`) — so for a
+stock ticker, Fear & Greed (weight 0.07 by default) is the *only* survivor,
+and the old renormalization logic would silently hand it 100% of the score.
+To stop a single thin source from driving a trade, `AggregatedSentiment` now
+carries:
+
+- `coverage` — the sum of base weights of currently-available sources divided
+  by the sum of all positive base weights.
+- `actionable` — `coverage >= SENTIMENT_MIN_COVERAGE` (default `0.5`, plain
+  `.env`). When not actionable, `score` is forced to `0.0` and `label` to
+  `"insufficient_data"` instead of computing a renormalized score from
+  whatever thin sliver of data is available.
+
+The engine skips new entries when `not sentiment.actionable`, and exits never
+infer a sentiment-reversal from a non-actionable score (price-based
+take-profit/stop-loss still apply). This is also why `ENABLE_STOCKS` /
+`ENABLE_OPTIONS` are off by default in `environments/*.env` today — see
+`sentiment.base.EQUITY_CAPABLE_SOURCES`.
+
+## Per-source result cache
+
+Each source is queried up to twice per symbol per crypto cycle, and some
+(Google Trends especially) rate-limit hard. `SentimentAggregator` caches each
+source's result per coin for a per-source TTL (plain `.env`, seconds):
+
+| Source                | TTL env var                | Default |
+|------------------------|----------------------------|---------|
+| Fear & Greed           | `SENTIMENT_TTL_FEAR_GREED` | 3600    |
+| Google Trends          | `SENTIMENT_TTL_TRENDS`     | 3600    |
+| Reddit                 | `SENTIMENT_TTL_REDDIT`     | 600     |
+| cryptocurrency.cv      | `SENTIMENT_TTL_CRYPTOCV`   | 600     |
+| LunarCrush             | `SENTIMENT_TTL_LUNARCRUSH` | 900     |
+| CoinGecko              | `SENTIMENT_TTL_COINGECKO`  | 300     |
+
+An `unavailable` result (dead API, missing key) is cached for at most ~60
+seconds regardless of the source's normal TTL, so a down provider is retried
+soon instead of staying dark for its full (possibly hour-long) window. The
+cache key is `(source, coin)`; a fresh `SentimentAggregator` (as constructed
+once per `TradingEngine`) starts with an empty cache.
+
 ### Removed sources
 `CryptoPanic` (free tier killed Aug 2026), `Twitter/X` (shelved),
 `pytrends` (archived Apr 2025 -> replaced by `trendspyg`), and `NewsAPI`

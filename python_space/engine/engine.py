@@ -458,6 +458,7 @@ class TradingEngine:
                     pos.entry_price, price, sent.score,
                     take_profit_pct=self.tier.crypto_take_profit_pct,
                     stop_loss_pct=self.tier.crypto_stop_loss_pct,
+                    actionable=sent.actionable,
                 )
                 if decision.is_close:
                     if self._close_position(session, pos, price, decision.reason):
@@ -482,6 +483,13 @@ class TradingEngine:
                     continue
                 if not self._has_cap_room(session, MARKET_CRYPTO):
                     report.skipped += 1
+                    continue
+                if not sent.actionable:
+                    report.skipped += 1
+                    self._log_signal(
+                        session, MARKET_CRYPTO, symbol, sent.score, sent.label, False,
+                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                    )
                     continue
                 decision = av.crypto_entry_decision(symbol, sent.score)
                 if decision.is_open:
@@ -541,6 +549,7 @@ class TradingEngine:
                     pos.entry_price, price, sent.score,
                     take_profit_pct=self.tier.stock_take_profit_pct,
                     stop_loss_pct=self.tier.stock_stop_loss_pct,
+                    actionable=sent.actionable,
                 )
                 if decision.is_close:
                     if self._close_position(session, pos, price, decision.reason):
@@ -560,6 +569,13 @@ class TradingEngine:
                 if not self.config.avenues.stocks or not self._has_cap_room(session, MARKET_STOCK):
                     report.skipped += 1
                     self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
+                    continue
+                if not sent.actionable:
+                    report.skipped += 1
+                    self._log_signal(
+                        session, MARKET_STOCK, ticker, sent.score, sent.label, False,
+                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                    )
                     continue
                 decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
                 if decision.is_open:
@@ -627,6 +643,13 @@ class TradingEngine:
             for underlying in self.config.stock_tickers:
                 sent = self.aggregator.get_sentiment(underlying)
                 report.evaluated += 1
+                if not sent.actionable:
+                    report.skipped += 1
+                    self._log_signal(
+                        session, MARKET_OPTION, underlying, sent.score, sent.label, False,
+                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                    )
+                    continue
                 side = av.option_side_for_score(sent.score)
                 if side is None:
                     report.skipped += 1
