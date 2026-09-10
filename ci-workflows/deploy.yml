@@ -34,7 +34,10 @@ jobs:
       # Deploy target is the reserved IP / host of the droplet.
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       RESERVED_IPV4: ${{ secrets.RESERVED_IPV4 }}
-      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+      # NOTE: DOPPLER_TOKEN is intentionally not threaded through this
+      # workflow -- the systemd unit's own ExecStart wraps `doppler run --`
+      # around the app (see deploy/scalpbot.service), reading its own token
+      # from /etc/scalpbot/doppler.env on the droplet.
 
     steps:
       - name: Checkout
@@ -61,9 +64,14 @@ jobs:
 
       - name: Deploy over SSH
         run: |
+          # Installs into a venv (system Python on recent Ubuntu refuses a
+          # bare `pip install` under PEP 668) and only restarts the service --
+          # the systemd unit's own ExecStart wraps `doppler run --` around the
+          # app itself (see deploy/scalpbot.service), so secrets no longer
+          # need to be threaded through this SSH command.
           ssh -n -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new \
             root@"${DEPLOY_TARGET}" \
             "cd /opt/scalpbot && git pull --ff-only && \
-             pip install -r python_space/requirements.txt && \
-             DOPPLER_TOKEN='${DOPPLER_TOKEN}' doppler run -- \
-               systemctl restart scalpbot"
+             python3 -m venv --upgrade-deps venv && \
+             venv/bin/pip install -r python_space/requirements.txt && \
+             systemctl restart scalpbot"

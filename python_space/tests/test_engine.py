@@ -277,6 +277,28 @@ def test_crypto_cycle_opens_on_bullish(session_factory):
     s.close()
 
 
+def test_open_entries_alone_opens_on_bullish(session_factory):
+    # Regression coverage for the PR4 split: open_entries(market) alone must
+    # behave like the entries half of run_crypto_cycle.
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6))
+    r = e.open_entries(MARKET_CRYPTO)
+    assert r.opened >= 1
+    assert _count_open(session_factory) == r.opened
+
+
+def test_manage_exits_alone_closes_on_take_profit(session_factory):
+    e = TradingEngine(config=_cfg(), session_factory=session_factory,
+                      alpaca=FakeAlpaca(price=150.0), aggregator=FakeAgg(0.6))
+    e.open_entries(MARKET_CRYPTO)
+    assert _count_open(session_factory) >= 1
+    # a big price jump clears the tier's crypto take-profit
+    e.alpaca.price = 150.0 * 1.20
+    r = e.manage_exits(MARKET_CRYPTO)
+    assert r.closed >= 1
+    assert _count_open(session_factory) == 0
+
+
 def test_total_cap_enforced(session_factory):
     cfg = _cfg()
     cfg.caps.total = 2

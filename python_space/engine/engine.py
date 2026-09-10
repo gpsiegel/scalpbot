@@ -450,6 +450,76 @@ class TradingEngine:
         return warnings
 
     # -- crypto -------------------------------------------------------------
+    def _manage_crypto_exits(self, session, report: CycleReport) -> None:
+        for pos in self._open_positions(session, MARKET_CRYPTO):
+            coin = pos.symbol.split("/")[0]
+            price = self.alpaca.get_crypto_price(pos.symbol)
+            if price is None:
+                continue
+            sent = self.aggregator.get_sentiment(coin)
+            decision = av.linear_exit_decision(
+                MARKET_CRYPTO, pos.symbol, pos.side,
+                pos.entry_price, price, sent.score,
+                take_profit_pct=self.tier.crypto_take_profit_pct,
+                stop_loss_pct=self.tier.crypto_stop_loss_pct,
+                actionable=sent.actionable,
+            )
+            if decision.is_close:
+                if self._close_position(session, pos, price, decision.reason):
+                    report.closed += 1
+                else:
+                    report.held += 1
+                    report.errors.append(f"close rejected for {pos.symbol}")
+            else:
+                report.held += 1
+
+    def _open_crypto_entries(self, session, report: CycleReport) -> None:
+        for coin in self.config.all_crypto_coins:
+            symbol = self.config.crypto_symbol(coin)
+            sent = self.aggregator.get_sentiment(coin)
+            report.evaluated += 1
+            if self._has_open(session, MARKET_CRYPTO, symbol):
+                self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
+                continue
+            if not self.config.avenues.crypto:
+                self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
+                report.skipped += 1
+                continue
+            if not self._has_cap_room(session, MARKET_CRYPTO):
+                report.skipped += 1
+                continue
+            if not sent.actionable:
+                report.skipped += 1
+                self._log_signal(
+                    session, MARKET_CRYPTO, symbol, sent.score, sent.label, False,
+                    f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                )
+                continue
+            decision = av.crypto_entry_decision(symbol, sent.score)
+            if decision.is_open:
+                ok, reason, paper_only = self._passes_entry_gates(
+                    session, MARKET_CRYPTO, symbol, sent.score,
+                    self.tier.crypto_take_profit_pct,
+                    self.tier.crypto_stop_loss_pct,
+                )
+                if not ok:
+                    report.skipped += 1
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+                    continue
+                price = self.alpaca.get_crypto_price(symbol)
+                if price:
+                    status, err = self._open_position(
+                        session, MARKET_CRYPTO, symbol, decision, price,
+                        place_order=not paper_only,
+                    )
+                    self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, reason)
+                else:
+                    report.skipped += 1
+                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
+            else:
+                report.skipped += 1
+                self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
+
     def run_crypto_cycle(self) -> CycleReport:
         report = CycleReport(market=MARKET_CRYPTO, mode=self.mode)
         if not self.config.crypto_core_coins and not self.config.crypto_satellite_coins:
@@ -459,77 +529,8 @@ class TradingEngine:
         session = self.session_factory()
         try:
             report.errors.extend(self.reconcile(session, MARKET_CRYPTO))
-
-            # 1) manage exits
-            for pos in self._open_positions(session, MARKET_CRYPTO):
-                coin = pos.symbol.split("/")[0]
-                price = self.alpaca.get_crypto_price(pos.symbol)
-                if price is None:
-                    continue
-                sent = self.aggregator.get_sentiment(coin)
-                decision = av.linear_exit_decision(
-                    MARKET_CRYPTO, pos.symbol, pos.side,
-                    pos.entry_price, price, sent.score,
-                    take_profit_pct=self.tier.crypto_take_profit_pct,
-                    stop_loss_pct=self.tier.crypto_stop_loss_pct,
-                    actionable=sent.actionable,
-                )
-                if decision.is_close:
-                    if self._close_position(session, pos, price, decision.reason):
-                        report.closed += 1
-                    else:
-                        report.held += 1
-                        report.errors.append(f"close rejected for {pos.symbol}")
-                else:
-                    report.held += 1
-
-            # 2) entries
-            for coin in self.config.all_crypto_coins:
-                symbol = self.config.crypto_symbol(coin)
-                sent = self.aggregator.get_sentiment(coin)
-                report.evaluated += 1
-                if self._has_open(session, MARKET_CRYPTO, symbol):
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
-                    continue
-                if not self.config.avenues.crypto:
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
-                    report.skipped += 1
-                    continue
-                if not self._has_cap_room(session, MARKET_CRYPTO):
-                    report.skipped += 1
-                    continue
-                if not sent.actionable:
-                    report.skipped += 1
-                    self._log_signal(
-                        session, MARKET_CRYPTO, symbol, sent.score, sent.label, False,
-                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
-                    )
-                    continue
-                decision = av.crypto_entry_decision(symbol, sent.score)
-                if decision.is_open:
-                    ok, reason, paper_only = self._passes_entry_gates(
-                        session, MARKET_CRYPTO, symbol, sent.score,
-                        self.tier.crypto_take_profit_pct,
-                        self.tier.crypto_stop_loss_pct,
-                    )
-                    if not ok:
-                        report.skipped += 1
-                        self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
-                        continue
-                    price = self.alpaca.get_crypto_price(symbol)
-                    if price:
-                        status, err = self._open_position(
-                            session, MARKET_CRYPTO, symbol, decision, price,
-                            place_order=not paper_only,
-                        )
-                        self._record_open_outcome(session, report, status, err, MARKET_CRYPTO, symbol, sent, reason)
-                    else:
-                        report.skipped += 1
-                        self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False, reason)
-                else:
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_CRYPTO, symbol, sent.score, sent.label, False)
-
+            self._manage_crypto_exits(session, report)
+            self._open_crypto_entries(session, report)
             session.commit()
         except Exception as exc:  # pragma: no cover - defensive
             session.rollback()
@@ -540,6 +541,71 @@ class TradingEngine:
         return report
 
     # -- stocks -------------------------------------------------------------
+    def _manage_stock_exits(self, session, report: CycleReport) -> None:
+        for pos in self._open_positions(session, MARKET_STOCK):
+            price = self.alpaca.get_stock_price(pos.symbol)
+            if price is None:
+                continue
+            sent = self.aggregator.get_sentiment(pos.symbol)
+            decision = av.linear_exit_decision(
+                MARKET_STOCK, pos.symbol, pos.side,
+                pos.entry_price, price, sent.score,
+                take_profit_pct=self.tier.stock_take_profit_pct,
+                stop_loss_pct=self.tier.stock_stop_loss_pct,
+                actionable=sent.actionable,
+            )
+            if decision.is_close:
+                if self._close_position(session, pos, price, decision.reason):
+                    report.closed += 1
+                else:
+                    report.held += 1
+                    report.errors.append(f"close rejected for {pos.symbol}")
+            else:
+                report.held += 1
+
+    def _open_stock_entries(self, session, report: CycleReport) -> None:
+        for ticker in self.config.stock_tickers:
+            sent = self.aggregator.get_sentiment(ticker)
+            report.evaluated += 1
+            if self._has_open(session, MARKET_STOCK, ticker):
+                self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
+                continue
+            if not self.config.avenues.stocks or not self._has_cap_room(session, MARKET_STOCK):
+                report.skipped += 1
+                self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
+                continue
+            if not sent.actionable:
+                report.skipped += 1
+                self._log_signal(
+                    session, MARKET_STOCK, ticker, sent.score, sent.label, False,
+                    f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                )
+                continue
+            decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
+            if decision.is_open:
+                ok, reason, paper_only = self._passes_entry_gates(
+                    session, MARKET_STOCK, ticker, sent.score,
+                    self.tier.stock_take_profit_pct,
+                    self.tier.stock_stop_loss_pct,
+                )
+                if not ok:
+                    report.skipped += 1
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+                    continue
+                price = self.alpaca.get_stock_price(ticker)
+                if price:
+                    status, err = self._open_position(
+                        session, MARKET_STOCK, ticker, decision, price,
+                        place_order=not paper_only,
+                    )
+                    self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, reason)
+                else:
+                    report.skipped += 1
+                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
+            else:
+                report.skipped += 1
+                self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
+
     def run_stock_cycle(self) -> CycleReport:
         report = CycleReport(market=MARKET_STOCK, mode=self.mode)
         if not self.config.stock_tickers:
@@ -552,70 +618,8 @@ class TradingEngine:
         session = self.session_factory()
         try:
             report.errors.extend(self.reconcile(session, MARKET_STOCK))
-
-            for pos in self._open_positions(session, MARKET_STOCK):
-                price = self.alpaca.get_stock_price(pos.symbol)
-                if price is None:
-                    continue
-                sent = self.aggregator.get_sentiment(pos.symbol)
-                decision = av.linear_exit_decision(
-                    MARKET_STOCK, pos.symbol, pos.side,
-                    pos.entry_price, price, sent.score,
-                    take_profit_pct=self.tier.stock_take_profit_pct,
-                    stop_loss_pct=self.tier.stock_stop_loss_pct,
-                    actionable=sent.actionable,
-                )
-                if decision.is_close:
-                    if self._close_position(session, pos, price, decision.reason):
-                        report.closed += 1
-                    else:
-                        report.held += 1
-                        report.errors.append(f"close rejected for {pos.symbol}")
-                else:
-                    report.held += 1
-
-            for ticker in self.config.stock_tickers:
-                sent = self.aggregator.get_sentiment(ticker)
-                report.evaluated += 1
-                if self._has_open(session, MARKET_STOCK, ticker):
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
-                    continue
-                if not self.config.avenues.stocks or not self._has_cap_room(session, MARKET_STOCK):
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
-                    continue
-                if not sent.actionable:
-                    report.skipped += 1
-                    self._log_signal(
-                        session, MARKET_STOCK, ticker, sent.score, sent.label, False,
-                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
-                    )
-                    continue
-                decision = av.stock_entry_decision(ticker, sent.score, self.config.allow_short)
-                if decision.is_open:
-                    ok, reason, paper_only = self._passes_entry_gates(
-                        session, MARKET_STOCK, ticker, sent.score,
-                        self.tier.stock_take_profit_pct,
-                        self.tier.stock_stop_loss_pct,
-                    )
-                    if not ok:
-                        report.skipped += 1
-                        self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
-                        continue
-                    price = self.alpaca.get_stock_price(ticker)
-                    if price:
-                        status, err = self._open_position(
-                            session, MARKET_STOCK, ticker, decision, price,
-                            place_order=not paper_only,
-                        )
-                        self._record_open_outcome(session, report, status, err, MARKET_STOCK, ticker, sent, reason)
-                    else:
-                        report.skipped += 1
-                        self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False, reason)
-                else:
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_STOCK, ticker, sent.score, sent.label, False)
-
+            self._manage_stock_exits(session, report)
+            self._open_stock_entries(session, report)
             session.commit()
         except Exception as exc:  # pragma: no cover - defensive
             session.rollback()
@@ -626,6 +630,94 @@ class TradingEngine:
         return report
 
     # -- options ------------------------------------------------------------
+    def _manage_option_exits(self, session, report: CycleReport) -> None:
+        # Re-quote, premium target/stop, and a DTE-based expiry exit that
+        # fires independent of P&L.
+        for pos in self._open_positions(session, MARKET_OPTION):
+            quote = self.alpaca.get_option_quote(pos.symbol)
+            action = None
+            if quote is not None:
+                bid, _ask = quote
+                pos.current_price = bid
+                action = opt.exit_decision(
+                    pos.entry_price, bid, self.tier.option_profit_target_pct,
+                )
+            dte = opt.days_to_expiration(pos.expiration) if pos.expiration else None
+            if dte is not None and dte <= self.config.option_exit_dte:
+                action = "dte_exit"
+            if action:
+                current_premium = pos.current_price or pos.entry_price
+                if self._close_option_position(session, pos, current_premium, action):
+                    report.closed += 1
+                else:
+                    report.held += 1
+                    report.errors.append(f"close rejected for {pos.symbol}")
+            else:
+                report.held += 1
+
+    def _open_option_entries(self, session, report: CycleReport) -> None:
+        for underlying in self.config.stock_tickers:
+            sent = self.aggregator.get_sentiment(underlying)
+            report.evaluated += 1
+            if not sent.actionable:
+                report.skipped += 1
+                self._log_signal(
+                    session, MARKET_OPTION, underlying, sent.score, sent.label, False,
+                    f"insufficient sentiment coverage ({sent.coverage:.2f})",
+                )
+                continue
+            side = av.option_side_for_score(sent.score)
+            if side is None:
+                report.skipped += 1
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
+                continue
+            if not self.config.avenues.options or not self._has_cap_room(session, MARKET_OPTION):
+                report.skipped += 1
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
+                continue
+            if self._has_open_option_for_underlying(session, underlying):
+                report.skipped += 1
+                self._log_signal(
+                    session, MARKET_OPTION, underlying, sent.score, sent.label, False,
+                    f"already holding an option on {underlying}",
+                )
+                continue
+            spot = self.alpaca.get_stock_price(underlying)
+            if not spot:
+                report.skipped += 1
+                continue
+            contracts = self.alpaca.list_option_contracts(
+                underlying, side, spot, self.config.options,
+            )
+            choice = opt.select_contract(contracts, spot, side, self.config.options)
+            if choice is None:
+                report.skipped += 1
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
+                continue
+            # risk gates: cooldown, tier conviction, Groq, EV. For options the
+            # EV projection uses the tier's premium profit target vs. the -35%
+            # premium stop encoded in the options ladder.
+            ok, reason, paper_only = self._passes_entry_gates(
+                session, MARKET_OPTION, underlying, sent.score,
+                self.tier.option_profit_target_pct, abs(opt.STOP_LOSS),
+            )
+            if not ok:
+                report.skipped += 1
+                self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, reason)
+                continue
+            n = opt.contracts_for_budget(choice.premium, self.tier.position_budget_usd)
+            if n < 1:
+                report.skipped += 1
+                continue
+            status, err = self._open_option_position(
+                session, underlying, side, choice, n, sent.score,
+                place_order=not paper_only,
+            )
+            self._record_open_outcome(
+                session, report, status, err, MARKET_OPTION,
+                choice.contract.symbol, sent, reason,
+            )
+
     def run_options_cycle(self) -> CycleReport:
         report = CycleReport(market=MARKET_OPTION, mode=self.mode)
         if not self.config.stock_tickers:
@@ -638,98 +730,82 @@ class TradingEngine:
         session = self.session_factory()
         try:
             report.errors.extend(self.reconcile(session, MARKET_OPTION))
-
-            # 1) manage open option positions: re-quote, premium target/stop,
-            # and a DTE-based expiry exit that fires independent of P&L.
-            for pos in self._open_positions(session, MARKET_OPTION):
-                quote = self.alpaca.get_option_quote(pos.symbol)
-                action = None
-                if quote is not None:
-                    bid, _ask = quote
-                    pos.current_price = bid
-                    action = opt.exit_decision(
-                        pos.entry_price, bid, self.tier.option_profit_target_pct,
-                    )
-                dte = opt.days_to_expiration(pos.expiration) if pos.expiration else None
-                if dte is not None and dte <= self.config.option_exit_dte:
-                    action = "dte_exit"
-                if action:
-                    current_premium = pos.current_price or pos.entry_price
-                    if self._close_option_position(session, pos, current_premium, action):
-                        report.closed += 1
-                    else:
-                        report.held += 1
-                        report.errors.append(f"close rejected for {pos.symbol}")
-                else:
-                    report.held += 1
-
-            # 2) entries
-            for underlying in self.config.stock_tickers:
-                sent = self.aggregator.get_sentiment(underlying)
-                report.evaluated += 1
-                if not sent.actionable:
-                    report.skipped += 1
-                    self._log_signal(
-                        session, MARKET_OPTION, underlying, sent.score, sent.label, False,
-                        f"insufficient sentiment coverage ({sent.coverage:.2f})",
-                    )
-                    continue
-                side = av.option_side_for_score(sent.score)
-                if side is None:
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
-                    continue
-                if not self.config.avenues.options or not self._has_cap_room(session, MARKET_OPTION):
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
-                    continue
-                if self._has_open_option_for_underlying(session, underlying):
-                    report.skipped += 1
-                    self._log_signal(
-                        session, MARKET_OPTION, underlying, sent.score, sent.label, False,
-                        f"already holding an option on {underlying}",
-                    )
-                    continue
-                spot = self.alpaca.get_stock_price(underlying)
-                if not spot:
-                    report.skipped += 1
-                    continue
-                contracts = self.alpaca.list_option_contracts(
-                    underlying, side, spot, self.config.options,
-                )
-                choice = opt.select_contract(contracts, spot, side, self.config.options)
-                if choice is None:
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False)
-                    continue
-                # risk gates: cooldown, tier conviction, Groq, EV. For options the
-                # EV projection uses the tier's premium profit target vs. the -35%
-                # premium stop encoded in the options ladder.
-                ok, reason, paper_only = self._passes_entry_gates(
-                    session, MARKET_OPTION, underlying, sent.score,
-                    self.tier.option_profit_target_pct, abs(opt.STOP_LOSS),
-                )
-                if not ok:
-                    report.skipped += 1
-                    self._log_signal(session, MARKET_OPTION, underlying, sent.score, sent.label, False, reason)
-                    continue
-                n = opt.contracts_for_budget(choice.premium, self.tier.position_budget_usd)
-                if n < 1:
-                    report.skipped += 1
-                    continue
-                status, err = self._open_option_position(
-                    session, underlying, side, choice, n, sent.score,
-                    place_order=not paper_only,
-                )
-                self._record_open_outcome(
-                    session, report, status, err, MARKET_OPTION,
-                    choice.contract.symbol, sent, reason,
-                )
-
+            self._manage_option_exits(session, report)
+            self._open_option_entries(session, report)
             session.commit()
         except Exception as exc:  # pragma: no cover - defensive
             session.rollback()
             logger.exception("options cycle failed")
+            report.errors.append(str(exc))
+        finally:
+            session.close()
+        return report
+
+    # -- scheduler entry points ----------------------------------------------
+    # Thin per-market dispatchers used by python_space/runner.py: exits are
+    # driven far more often than entries (a stop-loss can't wait for the next
+    # entry scan), so each half needs its own independent call with its own
+    # session/commit lifecycle. run_*_cycle above still runs both halves in
+    # one transaction, unchanged, for the API and existing tests.
+    _EXIT_METHODS = {
+        MARKET_CRYPTO: "_manage_crypto_exits",
+        MARKET_STOCK: "_manage_stock_exits",
+        MARKET_OPTION: "_manage_option_exits",
+    }
+    _ENTRY_METHODS = {
+        MARKET_CRYPTO: "_open_crypto_entries",
+        MARKET_STOCK: "_open_stock_entries",
+        MARKET_OPTION: "_open_option_entries",
+    }
+
+    def manage_exits(self, market: str) -> CycleReport:
+        """Run only the exit-management half of one market's cycle.
+
+        Unlike run_*_cycle, this never bails out for "nothing configured" --
+        an emptied STOCK_TICKERS shouldn't stop the bot from managing
+        positions it already opened while tickers were configured.
+        """
+        report = CycleReport(market=market, mode=self.mode)
+        if market != MARKET_CRYPTO and self.config.respect_market_hours and not self.alpaca.is_market_open():
+            report.errors.append("market closed")
+            return report
+
+        session = self.session_factory()
+        try:
+            report.errors.extend(self.reconcile(session, market))
+            getattr(self, self._EXIT_METHODS[market])(session, report)
+            session.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            session.rollback()
+            logger.exception("%s exits failed", market)
+            report.errors.append(str(exc))
+        finally:
+            session.close()
+        return report
+
+    def open_entries(self, market: str) -> CycleReport:
+        """Run only the new-entry half of one market's cycle."""
+        report = CycleReport(market=market, mode=self.mode)
+        if market == MARKET_CRYPTO and not self.config.all_crypto_coins:
+            report.errors.append("no crypto coins configured")
+            return report
+        if market == MARKET_STOCK and not self.config.stock_tickers:
+            report.errors.append("no stock tickers configured")
+            return report
+        if market == MARKET_OPTION and not self.config.stock_tickers:
+            report.errors.append("no underlyings configured (uses STOCK_TICKERS)")
+            return report
+        if market != MARKET_CRYPTO and self.config.respect_market_hours and not self.alpaca.is_market_open():
+            report.errors.append("market closed")
+            return report
+
+        session = self.session_factory()
+        try:
+            getattr(self, self._ENTRY_METHODS[market])(session, report)
+            session.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            session.rollback()
+            logger.exception("%s entries failed", market)
             report.errors.append(str(exc))
         finally:
             session.close()

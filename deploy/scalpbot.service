@@ -1,0 +1,46 @@
+# =============================================================================
+# scalpbot.service -- systemd unit for the scalpbot scheduler + control-plane
+# API (python_space/runner.py, one process, see its module docstring).
+# =============================================================================
+# Install (one-time, on the droplet):
+#   cp deploy/scalpbot.service /etc/systemd/system/scalpbot.service
+#   systemctl daemon-reload
+#   systemctl enable --now scalpbot
+#
+# ci-workflows/deploy.yml creates/updates the venv at /opt/scalpbot/venv and
+# restarts this unit on every deploy; it does not (re)install the unit file
+# itself.
+# =============================================================================
+
+[Unit]
+Description=scalpbot trading engine (scheduler + control-plane API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scalpbot
+Group=scalpbot
+WorkingDirectory=/opt/scalpbot/python_space
+Environment=PYTHONUNBUFFERED=1
+
+# `doppler run --` needs DOPPLER_TOKEN in its own environment to authenticate
+# and inject the rest of the app's secrets (ALPACA_*, DATABASE_URL, etc.) into
+# the process it wraps. That token is never committed here; it must be
+# provisioned onto the droplet out-of-band (e.g. an infra step writing
+# /etc/scalpbot/doppler.env with DOPPLER_TOKEN=... and mode 0600). The leading
+# "-" makes a missing file a non-fatal no-op rather than a failed start.
+EnvironmentFile=-/etc/scalpbot/doppler.env
+
+ExecStart=/usr/bin/doppler run -- /opt/scalpbot/venv/bin/python -m runner
+Restart=on-failure
+RestartSec=5
+
+# Let runner.py's SIGTERM handler (Runner.request_stop) shut down cleanly --
+# it stops the scheduler loop and signals uvicorn to stop -- before systemd
+# would otherwise escalate to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
