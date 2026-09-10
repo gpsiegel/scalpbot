@@ -496,7 +496,7 @@ def test_rejected_close_leaves_position_open(session_factory):
     closed = e._close_position(s, pos, 105.0, "take profit")
     assert closed is False
     assert pos.status == POSITION_OPEN
-    assert e.loss_tracker._counts.get(MARKET_CRYPTO, 0) == 0
+    assert e.loss_tracker._get_count(MARKET_CRYPTO, s) == 0
     s.close()
 
 

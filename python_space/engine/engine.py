@@ -26,7 +26,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from config import Config, get_config
 from sentiment.aggregator import SentimentAggregator
@@ -83,11 +83,13 @@ class ConsecutiveLossTracker:
     """Circuit breaker: pause a market after too many consecutive losses.
 
     Scalping's fastest way to ruin is revenge-trading a losing streak. This
-    tracker counts *consecutive* losing closes per market (in memory) and, once
+    tracker counts *consecutive* losing closes per market, persisted in the
+    ``bot_config`` table (so a redeploy doesn't quietly reset the streak to
+    zero and hand back the very risk this breaker exists to catch) and, once
     the streak hits :data:`LOSS_THRESHOLD`, writes a cooldown timestamp
-    :data:`COOLDOWN_MINUTES` into the future to the persistent ``bot_config``
-    table. While ``is_cooling_down`` is True the engine opens no new positions in
-    that market. A single winning close resets the streak; the cooldown itself
+    :data:`COOLDOWN_MINUTES` into the future to that same table. While
+    ``is_cooling_down`` is True the engine opens no new positions in that
+    market. A single winning close resets the streak; the cooldown itself
     simply expires with the clock.
     """
 
@@ -96,20 +98,34 @@ class ConsecutiveLossTracker:
     KEY_PREFIX = "cooldown_until_"
     LOSS_PREFIX = "consec_losses_"
 
-    def __init__(self) -> None:
-        # in-memory consecutive-loss counts per market
-        self._counts: Dict[str, int] = {}
+    def _get_count(self, market: str, session) -> int:
+        row = session.query(BotConfig).filter_by(key=f"{self.LOSS_PREFIX}{market}").first()
+        if row is None or not row.value:
+            return 0
+        try:
+            return int(row.value)
+        except ValueError:
+            return 0
 
-    def record_win(self, market: str) -> None:
+    def _set_count(self, market: str, count: int, session) -> None:
+        key = f"{self.LOSS_PREFIX}{market}"
+        row = session.query(BotConfig).filter_by(key=key).first()
+        if row is None:
+            session.add(BotConfig(key=key, value=str(count), market=market))
+        else:
+            row.value = str(count)
+
+    def record_win(self, market: str, session) -> None:
         """A winning close breaks the streak."""
-        self._counts[market] = 0
+        self._set_count(market, 0, session)
 
     def record_loss(self, market: str, session) -> None:
         """A losing close extends the streak; trip the breaker at the threshold."""
-        self._counts[market] = self._counts.get(market, 0) + 1
-        if self._counts[market] >= self.LOSS_THRESHOLD:
+        count = self._get_count(market, session) + 1
+        if count >= self.LOSS_THRESHOLD:
             self._set_cooldown(market, session)
-            self._counts[market] = 0  # reset streak once the breaker trips
+            count = 0  # reset streak once the breaker trips
+        self._set_count(market, count, session)
 
     def is_cooling_down(self, market: str, session) -> bool:
         """True while a cooldown timestamp for ``market`` is still in the future."""
@@ -1000,7 +1016,7 @@ class TradingEngine:
         """
         won = (realized_pnl or 0.0) > 0
         if won:
-            self.loss_tracker.record_win(market)
+            self.loss_tracker.record_win(market, session)
         else:
             self.loss_tracker.record_loss(market, session)
         if self.conf_gate.is_active(market, self.tier, session):

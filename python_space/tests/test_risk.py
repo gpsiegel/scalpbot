@@ -126,7 +126,7 @@ def test_loss_tracker_win_resets_streak(session_factory):
     t = ConsecutiveLossTracker()
     t.record_loss("crypto", s)
     t.record_loss("crypto", s)
-    t.record_win("crypto")            # streak reset
+    t.record_win("crypto", s)         # streak reset
     t.record_loss("crypto", s)
     t.record_loss("crypto", s)        # only 2 consecutive again
     assert t.is_cooling_down("crypto", s) is False
@@ -140,6 +140,21 @@ def test_loss_tracker_isolated_per_market(session_factory):
         t.record_loss("crypto", s)
     assert t.is_cooling_down("crypto", s) is True
     assert t.is_cooling_down("stock", s) is False     # unaffected
+    s.close()
+
+
+def test_loss_tracker_persists_across_new_instance(session_factory):
+    # A fresh ConsecutiveLossTracker (as created on every redeploy) must pick
+    # up an in-progress streak from bot_config rather than starting at zero.
+    s = session_factory()
+    t1 = ConsecutiveLossTracker()
+    t1.record_loss("crypto", s)
+    t1.record_loss("crypto", s)
+
+    t2 = ConsecutiveLossTracker()  # simulates a restart: no in-memory state
+    assert t2.is_cooling_down("crypto", s) is False
+    t2.record_loss("crypto", s)    # the 3rd consecutive loss, from t2's view
+    assert t2.is_cooling_down("crypto", s) is True
     s.close()
 
 
