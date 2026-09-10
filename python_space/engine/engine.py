@@ -160,23 +160,40 @@ class ConsecutiveLossTracker:
 
 
 class ConfidenceGate:
-    """Paper-validate a tier before it is allowed to place real orders.
+    """Paper-validate a tier's after-fee expectancy before it is allowed to
+    place real orders.
 
-    When a (market, tier) pair first runs -- or whenever the active tier changes
-    -- the gate opens and the next :data:`PAPER_TRADES` closes are taken as paper
-    trades and tallied. If at least :data:`WINS_REQUIRED` of them win, the gate
-    passes (closes) and the market may trade for real under that tier. If the
-    validation window fills without enough wins, the tally resets and another
-    paper window begins. State lives in the persistent ``bot_config`` table so it
-    survives restarts.
+    A simple win-count tally is a weak statistical test: 3-of-5 wins passes
+    a coin flip about half the time, and a strategy with a true 35% win rate
+    (below break-even) still clears it roughly 74% of the time within a
+    handful of automatic retries. This gate instead tallies the actual
+    after-fee P&L (:attr:`Position.realized_pnl` is already net of fees/spread)
+    of the next :data:`TRADES_REQUIRED` paper closes for a (market, tier)
+    pair, and passes only if their sum is positive -- an actual expectancy
+    check, not a coin-flip-shaped proxy for one.
+
+    A window that ends with non-positive expectancy does **not**
+    automatically retry: the gate is marked failed and stays that way,
+    blocking real orders for this (market, tier) indefinitely. Clearing it
+    requires an operator to explicitly reset it: ``POST /config`` with
+    ``key=f"gate_reset_{market}"`` and any value that differs from what the
+    gate last saw (an incrementing counter or a timestamp both work -- the
+    gate only checks that the value changed). Switching ``RISK_TIER`` still
+    opens a fresh window automatically, since that's a deliberate operator
+    change to a different strategy, not a retry of the one that just failed.
+
+    State lives in the persistent ``bot_config`` table so it survives
+    restarts.
     """
 
-    PAPER_TRADES = 5
-    WINS_REQUIRED = 3
+    TRADES_REQUIRED = 30
     ACTIVE_PREFIX = "gate_active_"
-    WINS_PREFIX = "gate_wins_"
+    FAILED_PREFIX = "gate_failed_"
+    PNL_SUM_PREFIX = "gate_pnl_sum_"
     TOTAL_PREFIX = "gate_total_"
     TIER_PREFIX = "gate_tier_"
+    RESET_PREFIX = "gate_reset_"
+    RESET_SEEN_PREFIX = "gate_reset_seen_"
 
     def _get(self, session, key: str) -> Optional[str]:
         row = session.query(BotConfig).filter_by(key=key).first()
@@ -189,59 +206,85 @@ class ConfidenceGate:
         else:
             row.value = value
 
+    def _manual_reset_requested(self, market: str, session) -> bool:
+        """True (once) when an operator has POSTed a new gate_reset_<market>
+        value via /config since the gate last consumed one."""
+        reset_value = self._get(session, f"{self.RESET_PREFIX}{market}")
+        if reset_value is None:
+            return False
+        seen_value = self._get(session, f"{self.RESET_SEEN_PREFIX}{market}")
+        if reset_value == seen_value:
+            return False
+        self._set(session, f"{self.RESET_SEEN_PREFIX}{market}", reset_value, market)
+        return True
+
     def initialize_if_needed(self, market: str, tier: TierParams, session) -> None:
-        """Open a fresh validation window when unset or when the tier changed."""
+        """Open a fresh validation window when unset, the tier changed, or an
+        operator requested a manual reset."""
         active = self._get(session, f"{self.ACTIVE_PREFIX}{market}")
         current_tier = self._get(session, f"{self.TIER_PREFIX}{market}")
-        if active is None or current_tier != tier.name:
+        tier_changed = active is not None and current_tier != tier.name
+        manual_reset = self._manual_reset_requested(market, session)
+        if active is None or tier_changed or manual_reset:
             self.reset(market, session)
             self._set(session, f"{self.TIER_PREFIX}{market}", tier.name, market)
 
     def reset(self, market: str, session) -> None:
-        """(Re)open the validation window: active, zero wins, zero total."""
+        """(Re)open the validation window: active, not failed, zero tally."""
         self._set(session, f"{self.ACTIVE_PREFIX}{market}", "1", market)
-        self._set(session, f"{self.WINS_PREFIX}{market}", "0", market)
+        self._set(session, f"{self.FAILED_PREFIX}{market}", "0", market)
+        self._set(session, f"{self.PNL_SUM_PREFIX}{market}", "0.0", market)
         self._set(session, f"{self.TOTAL_PREFIX}{market}", "0", market)
 
     def is_active(self, market: str, tier: TierParams, session) -> bool:
-        """True while the tier is still being paper-validated for ``market``."""
+        """True while real orders are blocked for ``market``: either still
+        validating, or blocked after a failed window pending manual reset."""
         self.initialize_if_needed(market, tier, session)
+        if self._get(session, f"{self.FAILED_PREFIX}{market}") == "1":
+            return True
         return self._get(session, f"{self.ACTIVE_PREFIX}{market}") == "1"
 
     def record_paper_trade(
-        self, market: str, tier: TierParams, won: bool, session
+        self, market: str, tier: TierParams, realized_pnl: float, session
     ) -> bool:
-        """Record one paper-trade outcome; return True if the gate just passed.
+        """Record one paper-trade's after-fee P&L; return True if the gate
+        just passed.
 
-        Fills the validation window; at :data:`PAPER_TRADES` trades it either
-        passes (>= :data:`WINS_REQUIRED` wins -> gate closes) or resets for
-        another window.
+        Fills the validation window; at :data:`TRADES_REQUIRED` trades it
+        either passes (positive cumulative P&L -> gate closes) or fails
+        (marked failed, blocked until a manual reset -- see the class
+        docstring). A no-op once already failed: it does not keep
+        accumulating toward a retry the gate will never attempt on its own.
         """
         self.initialize_if_needed(market, tier, session)
-        wins = int(self._get(session, f"{self.WINS_PREFIX}{market}") or "0")
+        if self._get(session, f"{self.FAILED_PREFIX}{market}") == "1":
+            return False
+
+        pnl_sum = float(self._get(session, f"{self.PNL_SUM_PREFIX}{market}") or "0.0")
         total = int(self._get(session, f"{self.TOTAL_PREFIX}{market}") or "0")
-        wins += 1 if won else 0
+        pnl_sum += realized_pnl or 0.0
         total += 1
 
-        if total >= self.PAPER_TRADES:
-            if wins >= self.WINS_REQUIRED:
+        if total >= self.TRADES_REQUIRED:
+            self._set(session, f"{self.PNL_SUM_PREFIX}{market}", str(pnl_sum), market)
+            self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
+            if pnl_sum > 0:
                 self._set(session, f"{self.ACTIVE_PREFIX}{market}", "0", market)
-                self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
-                self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
                 logger.info(
-                    "confidence gate PASSED for %s tier=%s (%d/%d wins)",
-                    market, tier.name, wins, total,
+                    "confidence gate PASSED for %s tier=%s (avg pnl %.4f over %d trades)",
+                    market, tier.name, pnl_sum / total, total,
                 )
                 return True
-            # window filled without enough wins -> reset and try again
-            self.reset(market, session)
-            logger.info(
-                "confidence gate reset for %s tier=%s (%d/%d wins, retrying)",
-                market, tier.name, wins, total,
+            self._set(session, f"{self.ACTIVE_PREFIX}{market}", "0", market)
+            self._set(session, f"{self.FAILED_PREFIX}{market}", "1", market)
+            logger.warning(
+                "confidence gate FAILED for %s tier=%s (avg pnl %.4f over %d trades); "
+                "blocked until a manual reset via POST /config key=%s%s",
+                market, tier.name, pnl_sum / total, total, self.RESET_PREFIX, market,
             )
             return False
 
-        self._set(session, f"{self.WINS_PREFIX}{market}", str(wins), market)
+        self._set(session, f"{self.PNL_SUM_PREFIX}{market}", str(pnl_sum), market)
         self._set(session, f"{self.TOTAL_PREFIX}{market}", str(total), market)
         return False
 
@@ -1020,7 +1063,7 @@ class TradingEngine:
         else:
             self.loss_tracker.record_loss(market, session)
         if self.conf_gate.is_active(market, self.tier, session):
-            self.conf_gate.record_paper_trade(market, self.tier, won, session)
+            self.conf_gate.record_paper_trade(market, self.tier, realized_pnl, session)
 
     def _open_option_position(
         self, session, underlying, side, choice, contracts, score, place_order: bool = True
